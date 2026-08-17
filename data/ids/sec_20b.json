@@ -1,0 +1,22 @@
+[
+ "exiv2.cve-2017-17669",
+ "faad2.cve-2018-20358",
+ "gpac.cve-2023-42298",
+ "imagemagick.cve-2019-13295",
+ "libheif.cve-2023-49464",
+ "libredwg.cve-2021-28236",
+ "libxml2.ossfuzz-42522712",
+ "matio.cve-2020-19497",
+ "md4c.cve-2018-11545",
+ "mruby.ossfuzz-42513165",
+ "mupdf.ossfuzz-42524969",
+ "njs.cve-2022-29780",
+ "openexr.ossfuzz-42524709",
+ "openjpeg.cve-2021-3575",
+ "php.ossfuzz-42515276",
+ "upx.ossfuzz-42531653",
+ "wabt.cve-2022-43282",
+ "wasm3.ossfuzz-42495624",
+ "yara.cve-2016-10211",
+ "yara.cve-2023-40857"
+]
