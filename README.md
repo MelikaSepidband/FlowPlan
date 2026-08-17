@@ -36,11 +36,14 @@ test generation (SWT-bench), and C security patching (SecBench).
 | benchmark | task | language | instances shipped |
 |---|---|---|---|
 | SWE-bench Pro | bug repair | Python | `samples/swebench_pro_n253` (253) |
-| SWT-bench | test generation | Python | same instances as SWE-bench Pro |
+| SWT-bench | test generation | Python | drawn from the same 253-instance SWE-bench Pro pool |
 | SecBench | security patch (sanitizer crash) | C/C++ | `samples/secbench_patch_n169` (169) |
 
 Canonical instance subsets used in our runs are in `data/ids/`
 (`swe_30/50/70`, `swt_30/50`, `sec_30/50`, plus the disjoint extension batches).
+Note the SWE and SWT subsets were sampled **independently** from the shared
+253-instance pool — they are not the same task lists (18 of the 50 ids
+coincide).
 
 ## Requirements
 
