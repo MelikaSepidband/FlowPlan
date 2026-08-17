@@ -29,23 +29,29 @@ The protocol is delivered as a **skill**: the user prompt starts with
 `claude-home/skills/flowfix/SKILL.md`) instructs: localize in the graph →
 declare the fault site → plan the graph delta → make the smallest code edit →
 re-verify the graph. Per-task variants exist for repair (SWE-bench Pro),
-test generation (SWT-bench), and C security patching (SecBench).
+test generation (SWT-bench protocol), and C security patching (SecBench).
 
 ## Benchmarks
 
 | benchmark | task | language | instances shipped |
 |---|---|---|---|
 | SWE-bench Pro | bug repair | Python | `samples/swebench_pro_n253` (253) |
-| SWT-bench | test generation | Python | the same 253 files — a different task on the same bugs |
+| SWT-bench protocol on SWE-bench Pro | test generation | Python | the same 253 files — a different task on the same bugs |
 | SecBench | security patch (sanitizer crash) | C/C++ | `samples/secbench_patch_n169` (169) |
 
-SWT-bench has no separate dataset here: test generation needs the same
-ingredients as repair (buggy repo, issue text, official fix + tests), so the
-SWT runner loads the same 253 instance files and asks the agent to write a
-reproducing test instead of a fix.
+**About the test-generation benchmark:** we follow the official
+[SWT-bench](https://arxiv.org/abs/2406.12952) task formulation and grading
+protocol (two test-suite runs — buggy tree vs. gold-fixed tree; success
+requires an agent-introduced fail→pass test and no pass→fail regression), but
+we apply it to **SWE-bench Pro instances** rather than the original SWT-bench
+dataset (which is derived from classic SWE-bench). Rationale: SWE-bench Pro is
+the contamination-resistant successor, and sharing one instance distribution
+between the repair and test-generation tasks keeps the cross-task comparison
+clean. Consequently these numbers are **not comparable to the official
+SWT-bench leaderboard**.
 
 The subsets we actually ran are in `data/ids/`: SWE-bench Pro on 70 of the 253
-(`swe_70.json`, built as 30 + 20 + 20), SWT-bench on 50 of the 253
+(`swe_70.json`, built as 30 + 20 + 20), test generation on 50 of the 253
 (`swt_50.json`, built as 30 + 20), SecBench on 50 of the 169 (`sec_50.json`).
 The SWE and SWT subsets were sampled independently, so they are different
 task lists (18 ids appear in both).
