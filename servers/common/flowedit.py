@@ -798,6 +798,33 @@ def class_method_specs(spec: str) -> list:
     return out
 
 
+def module_function_specs(spec: str) -> list:
+    """If ``spec`` names a MODULE (dotted path like 'galaxy.login' or a bare
+    module name), return its functions' 'file:line' anchors. Empty list when
+    no indexed file matches. Mirrors class_method_specs: agents routinely
+    name the MODULE the fix lives in (2026-08-14 audit: 'galaxy.login' meant
+    lib/ansible/galaxy/login.py, which existed -- the request just was not
+    expandable). Top-level functions preferred; methods included only when a
+    module has no top-level functions."""
+    from servers.cfg_server import server as cfg_srv
+    name = str(spec).strip()
+    if not name or ":" in name or name.endswith(_SRC_EXTS):
+        return []
+    rel_suffix = "/" + name.replace(".", "/") + ".py"
+    alt_suffix = name.replace(".", "/") + ".py"
+    try:
+        rows = cfg_srv._load_function_rows()
+    except Exception:
+        return []
+    in_mod = [r for r in rows
+              if str(r.get("file", "")).replace("\\", "/").endswith(rel_suffix)
+              or str(r.get("file", "")).replace("\\", "/") == alt_suffix]
+    if not in_mod:
+        return []
+    top = [r for r in in_mod if "." not in str(r.get("qualname", ""))]
+    return ["%s:%d" % (r["file"], r["line"]) for r in (top or in_mod)]
+
+
 def c_cfg_fingerprint(func_src: str, suffix: str = ".c") -> Optional[tuple]:
     """Joern-backed CFG fingerprint for a C/C++ function (see joern_cfg)."""
     from servers.common import joern_cfg
@@ -1144,22 +1171,68 @@ def func_fingerprint_head(rep: str, spec: str, anchor: str = ""):
 
 def py_func_source_by_name(text: str, name: str) -> Optional[str]:
     """Index-BYPASSING Python extraction (add_function verification): the
-    symbol index cannot know a function the agent just created, so we ast-
-    walk the given text by NAME. First match wins; None when the text does
-    not parse or no def carries the name."""
-    short = str(name).rsplit(".", 1)[-1].strip()
-    if not short:
+    symbol index cannot know a function the agent just created, so we walk
+    the given text by NAME.
+
+    Name-collision fix (2026-08-13): a QUALIFIED name is honored instead of
+    being stripped to its last component. The bare-name walk made every
+    ``__init__`` in a file interchangeable, which produced the manual study's
+    only verifier false-mismatch ("__init__ already exists at HEAD" for a
+    brand-new class's __init__, because LEGACY classes' __init__ matched) and
+    its knock-on false pass. Rules:
+      - bare name: first ``ast.walk`` match (byte-identical to the old
+        behavior);
+      - 'Class.method' where the class chain exists in this text: the def
+        whose enclosing class chain ends with the qualifier;
+      - qualifier looks like a CLASS (CapWords first letter) but no such
+        enclosure exists in this text: None -- the scoped function genuinely
+        is not here (e.g. the class is brand new at verify time / absent at
+        HEAD at plan time);
+      - qualifier looks like a MODULE path (lowercase): fall back to the
+        bare-name walk (module paths cannot be checked against file text).
+    None when the text does not parse or nothing matches."""
+    parts = [p for p in str(name).strip().split(".") if p.strip()]
+    if not parts:
         return None
+    short, qual = parts[-1], parts[:-1]
     try:
         tree = ast.parse(text)
     except (SyntaxError, ValueError):
         return None
-    for node in ast.walk(tree):
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) \
-                and node.name == short:
-            seg = ast.get_source_segment(text, node)
-            return _dedent(seg) if seg else None
-    return None
+
+    def _seg(node):
+        seg = ast.get_source_segment(text, node)
+        return _dedent(seg) if seg else None
+
+    def _bare():
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) \
+                    and node.name == short:
+                return _seg(node)
+        return None
+
+    if not qual:
+        return _bare()
+    cands = []          # (class_chain, node) in source order
+
+    def _walk(node, chain):
+        for ch in ast.iter_child_nodes(node):
+            if isinstance(ch, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                if ch.name == short:
+                    cands.append((chain, ch))
+                _walk(ch, chain)      # nested defs keep the class chain
+            elif isinstance(ch, ast.ClassDef):
+                _walk(ch, chain + [ch.name])
+            else:
+                _walk(ch, chain)
+
+    _walk(tree, [])
+    for chain, node in cands:
+        if len(chain) >= len(qual) and chain[-len(qual):] == qual:
+            return _seg(node)
+    if qual[-1][:1].isupper():
+        return None      # class-scoped, and that class scope is not here
+    return _bare()       # module-path qualifier: bare-name behavior
 
 
 def c_func_source_by_name(text: str, name: str) -> Optional[str]:
@@ -1169,12 +1242,33 @@ def c_func_source_by_name(text: str, name: str) -> Optional[str]:
     ';', since a ';' first means declaration or call statement). Heuristic
     by design; returns None rather than guessing when nothing matches."""
     import re
-    short = str(name).rsplit(".", 1)[-1].split("::")[-1].strip()
+    raw = str(name).rsplit(".", 1)[-1].strip()
+    short = raw.split("::")[-1].strip()
     if not short:
         return None
-    pat = re.compile(
-        r"^\s*(?:[A-Za-z_][\w\s\*&:<>,]*[\s\*&])?%s\s*\(" % re.escape(short))
+    # C++ analog of the Python name-collision fix (2026-08-14): when the name
+    # carries a Class:: qualifier, try the QUALIFIED out-of-class definition
+    # form first ('void Class::method(...)') so a same-named method of another
+    # class cannot shadow the target; fall back to the bare short name.
+    pats = []
+    if "::" in raw:
+        cls = raw.rsplit("::", 1)[0].split("::")[-1].strip()
+        if cls:
+            pats.append(re.compile(
+                r"^\s*(?:[A-Za-z_][\w\s\*&:<>,]*[\s\*&])?%s\s*::\s*%s\s*\("
+                % (re.escape(cls), re.escape(short))))
+    pats.append(re.compile(
+        r"^\s*(?:[A-Za-z_][\w\s\*&:<>,]*[\s\*&])?%s\s*\(" % re.escape(short)))
     lines = text.splitlines()
+    for pat in pats:
+        hit = _c_extract_at(lines, pat)
+        if hit is not None:
+            return hit
+    return None
+
+
+def _c_extract_at(lines: list, pat) -> Optional[str]:
+    """Brace-balance extraction from the first line matching ``pat``."""
     for i, ln in enumerate(lines):
         stripped = ln.lstrip()
         if stripped.startswith(("//", "/*", "*", "#")):
@@ -1530,10 +1624,14 @@ def render_def_use(func_name: str, pairs: list, code_at, engine_name: str,
     by_def: dict = {}
     for var, def_line, use_line in sorted(pairs)[:max_pairs]:
         by_def.setdefault((var, def_line), []).append(use_line)
+    # header counts come from the FULL pair set, not the displayed slice --
+    # counting the truncated grouping undercounted defs whenever the
+    # max_pairs cap elided rows (2026-08-14 audit: "13 defs" vs 14 actual)
+    n_defs_full = len({(v, d) for v, d, _u in pairs})
     n_vars = len({v for v, _d, _u in pairs})
     lines = [
         "value-flow (def-use) graph of %s()  [%d vars, %d defs, %d def->use "
-        "pairs, engine=%s]" % (func_name, n_vars, len(by_def), len(pairs),
+        "pairs, engine=%s]" % (func_name, n_vars, n_defs_full, len(pairs),
                                engine_name),
         "each row: a definition and every place its value is used:",
     ]
@@ -1639,7 +1737,14 @@ def dfg_flow_text(spec: str, max_pairs: int = 60) -> Optional[str]:
                 "Python function?)" % spec)
     offset = int(line) - 1
     pairs = [(var, d + offset, u + offset) for var, d, u in dfg.pairs]
+    # display name: for anchor specs ('path/file.py:123') the old
+    # basename-split produced "graph of py()" -- use the resolved row's real
+    # function name instead (2026-08-14 audit, cosmetic header mislabel)
     name = spec.split(":", 1)[0].rsplit(".", 1)[-1]
+    if ":" in spec:
+        _abs, _l, _e, row_name = _resolve_row(spec)
+        if row_name:
+            name = str(row_name).rsplit(".", 1)[-1]
 
     src_lines = src.splitlines()
 
@@ -1675,7 +1780,18 @@ def block_cfg_text(spec: str, max_blocks: int = 40) -> Optional[str]:
     if ":" in spec:
         rows = cfg_srv._resolve_functions(spec)
         if rows:
-            fname = rows[0].get("name", fname)
+            if flow_v3():
+                # v3 name-collision fix (2026-08-13): re-query by QUALNAME,
+                # not bare name. 'file.py:131' resolving to
+                # TaskQueueManager.__init__ used to re-query get_cfg with
+                # '__init__', which matched every __init__ in the file and
+                # the [:3] render cap then dropped the real target entirely
+                # (the manual study's one WRONG graph). v2 keeps the old
+                # behavior byte-identical.
+                fname = (rows[0].get("qualname")
+                         or rows[0].get("name", fname))
+            else:
+                fname = rows[0].get("name", fname)
     items = cfg_srv.get_cfg(fname, file=rel)
     if not items:
         return "(function %r not found for a control-flow graph)" % fname

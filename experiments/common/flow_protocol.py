@@ -422,16 +422,16 @@ def build_user_prompt(task: str, rep: str, tools, task_body: str,
                       agent: str = "claude") -> str:
     """The flow3 user prompt around ``task_body`` (the benchmark's own task
     text, WITHOUT any protocol steps). Skill mode (default): first line
-    is the agent-native invocation (``/flowfix`` for Claude Code),
-    followed by a blank line and task body; the protocol arrives via the
-    skill.
+    is the agent-native invocation (``/flowfix`` for Claude Code,
+    ``$flowfix`` for Codex), followed by a blank line and task body; the
+    protocol arrives via the skill.
     REPR_FLOW_SKILL=0: the protocol text inlined above the task body."""
     _validate(task, rep)
-    if agent != "claude":
-        raise ValueError("unknown agent %r (only 'claude' is supported)"
-                         % agent)
+    if agent not in ("claude", "codex"):
+        raise ValueError("unknown agent %r (want claude or codex)" % agent)
     if skill_mode():
-        return "/%s\n\n%s" % (SKILL_NAME, task_body)
+        marker = "$" if agent == "codex" else "/"
+        return "%s%s\n\n%s" % (marker, SKILL_NAME, task_body)
     return "%s\n\n%s" % (build_steps(task, rep, tools), task_body)
 
 

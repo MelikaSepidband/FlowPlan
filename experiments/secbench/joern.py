@@ -21,11 +21,8 @@ from pathlib import Path
 
 from experiments.secbench import trace as sec_trace
 
-# Tool locations, overridable via env (defaults match the study machine).
-JOERN_CLI = Path(os.environ.get("JOERN_CLI_DIR",
-                                str(Path.home() / "tools" / "joern-cli")))
-JDK_HOME = Path(os.environ.get("JOERN_JAVA_HOME",
-                               str(Path.home() / "tools" / "jdk-21.0.5+11")))
+JOERN_CLI = Path.home() / "tools" / "joern-cli"
+JDK_HOME = Path.home() / "tools" / "jdk-21.0.5+11"
 C2CPG = JOERN_CLI / "c2cpg.sh"
 
 

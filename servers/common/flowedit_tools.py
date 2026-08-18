@@ -265,11 +265,19 @@ def flow_of(functions: list) -> list:
                     item["note"] = mnote
             out.append(item)
             continue
-        # miss: if the spec names a CLASS, expand to its methods' flows.
+        # miss: if the spec names a CLASS, expand to its methods' flows;
+        # if it names a MODULE (dotted path), expand to its functions' flows.
         try:
             method_anchors = flowedit.class_method_specs(spec)
         except Exception:
             method_anchors = []
+        member_kind = "method"
+        if not method_anchors:
+            try:
+                method_anchors = flowedit.module_function_specs(spec)
+                member_kind = "function"
+            except Exception:
+                method_anchors = []
         if method_anchors:
             rendered = 0
             for anchor in method_anchors[:12]:
@@ -278,10 +286,21 @@ def flow_of(functions: list) -> list:
                 except Exception:
                     mtext = None
                 if mtext is not None:
-                    out.append({"function": "%s (method @ %s)" % (spec, anchor),
+                    out.append({"function": "%s (%s @ %s)"
+                                % (spec, member_kind, anchor),
                                 "cfg": mtext})
                     rendered += 1
             if rendered:
+                # truncation honesty (2026-08-14 audit: a 19-method class
+                # expanded to 12 with no disclosure): say when the expansion
+                # shows only a subset, so the agent can ask for the rest.
+                if len(method_anchors) > 12:
+                    out[-1].setdefault("note", "")
+                    out[-1]["note"] = (out[-1]["note"] + " " if out[-1]["note"]
+                                       else "") + (
+                        "expansion of %r shows 12 of %d members -- request "
+                        "the remaining ones by name or file:line anchor."
+                        % (spec, len(method_anchors)))
                 continue
         out.append({"function": spec, "cfg": None,
                     "note": "could not resolve %r. Pass the exact FUNCTION or "
@@ -613,7 +632,11 @@ def _addfn_locate(planned: dict):
         base = spec.split(":", 1)[0].strip()
         if base and not base.replace("\\", "/").lower().endswith(
                 flowedit._SRC_EXTS):
-            name = base.rsplit(".", 1)[-1]
+            # keep any Class qualifier (name-collision fix 2026-08-13):
+            # func_source_by_name scopes the lookup with it, so a brand-new
+            # class's __init__ no longer collides with legacy classes'
+            # __init__ in the same file ("already exists at HEAD").
+            name = base
             break
     return rel, name
 

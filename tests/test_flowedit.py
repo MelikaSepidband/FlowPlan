@@ -46,6 +46,32 @@ def test_dfg_delta_add_def_use():
                                                       "move_def_use")
 
 
+def test_legacy_verify_env_restores_prefix_behavior(tmp_path, monkeypatch,
+                                                    built_index):
+    """REPR_FLOW_LEGACY_VERIFY=1 (set by the runners for agent-facing tools)
+    must reproduce the PRE-FIX behavior: a drifted function is NOT found by
+    name (flow_check says 'cannot compute'), and the dfg classifier uses the
+    ordinal set-diff. Offline analysis (env unset) keeps the fixed paths."""
+    repo = _make_git_two_fn_proj(tmp_path, monkeypatch, "legacy")
+    monkeypatch.setenv("REPR_FLOW_LEGACY_VERIFY", "1")
+    from servers.common import flowedit_tools as fe
+    fe.flow_plan(deltas=[{"op": "add_guard", "function": "fn_b",
+                          "anchor": "m.py:5", "rationale": "guard None"}])
+    m = repo / "m.py"
+    m.write_text(("# padding\n" * 30) + m.read_text().replace(
+        "def fn_b(z):\n",
+        "def fn_b(z):\n    if z is None:\n        return None\n"))
+    chk = fe.flow_check(function="fn_b")[0]
+    assert chk["match"] is None, chk          # pre-fix: cannot compute
+    assert "cannot compute" in chk["note"]
+    # dfg legacy classifier: insertion-shift reads as move_def_use again
+    a = flowedit.dfg_fingerprint("def f(x):\n    y = g(x)\n    return h(y)\n")
+    b = flowedit.dfg_fingerprint(
+        "def f(x):\n    w = k(x)\n    y = g(w)\n    return h(y)\n")
+    assert flowedit.classify_delta("dfg", a, b) == "move_def_use"
+    monkeypatch.delenv("REPR_FLOW_LEGACY_VERIFY")
+
+
 def test_dfg_delta_insertion_is_add_not_move():
     """Regression for the ordinal-shift false mismatch: inserting a NEW
     def-use pair above existing ones shifts every later pair's ordinals; the
@@ -177,6 +203,42 @@ def test_cfg_view_renders_real_function(tmp_path, monkeypatch, built_index):
     assert "control-flow graph of validate_input()" in out["cfg"]
     # the fixture function has a loop over records -> a loop edge must appear
     assert "=loop=>" in out["cfg"] or "for record" in out["cfg"]
+
+
+def test_flow_plan_injects_cfg_when_blocks_enabled(tmp_path, monkeypatch,
+                                                   built_index):
+    """With REPR_CFG_BLOCKS=1, flow_plan folds the real block-CFG of each
+    planned function into its response (critical-path adoption of the graph)."""
+    from tests.conftest import FIXTURE_REPO
+    import shutil
+    repo = tmp_path / "bproj"
+    shutil.copytree(FIXTURE_REPO, repo)
+    from indexer.backends import get_backend
+    idx = repo / ".repr_index"
+    idx.mkdir(exist_ok=True)
+    get_backend("symbols").build(repo, idx)
+    monkeypatch.setenv("REPO_ROOT", str(repo))
+    monkeypatch.setenv("REPO_INDEX_DIR", str(idx))
+    monkeypatch.setenv("RUN_DIR", str(tmp_path / "run"))
+    monkeypatch.setenv("REPR_PERREP_REP", "cfg")
+    from servers.common import flowedit_tools as fe
+
+    # blocks OFF -> no CFG in the response
+    monkeypatch.delenv("REPR_CFG_BLOCKS", raising=False)
+    off = fe.flow_plan(deltas=[{"op": "add_guard",
+                                "function": "validate_input",
+                                "anchor": "x", "rationale": "y"}])[0]
+    assert "control_flow_graphs" not in off
+
+    # blocks ON -> the real CFG of validate_input is injected
+    monkeypatch.setenv("REPR_CFG_BLOCKS", "1")
+    on = fe.flow_plan(deltas=[{"op": "add_guard",
+                               "function": "validate_input",
+                               "anchor": "x", "rationale": "y"}])[0]
+    assert "control_flow_graphs" in on
+    assert "validate_input" in on["control_flow_graphs"]
+    assert "control-flow graph of validate_input()" in \
+        on["control_flow_graphs"]["validate_input"]
 
 
 def test_c_cfg_fingerprint_detects_added_guard():
@@ -1791,3 +1853,145 @@ def test_v3_absent_name_warns_and_checks_unknown(tmp_path, monkeypatch,
     assert chk["match"] is None, chk
     assert chk["verdict"] == "unknown"
 
+
+# --- name-collision fix (2026-08-13): class-scoped qualname resolution --------
+#
+# Root cause of the manual study's one WRONG graph (flow_of rendering other
+# classes' __init__ bodies) and both verifier errors in 322d7a (false mismatch
+# "__init__ already exists at HEAD" for a brand-new class -> agent waters the
+# plan down -> false pass): lookups stripped the class qualifier and matched
+# ANY same-named def in the file.
+
+_COLLISION_TEXT = '''\
+class CallbackSend:
+    def __init__(self, method_name):
+        self.method_name = method_name
+
+
+class DisplaySend:
+    def __init__(self, method):
+        self.method = method
+
+
+def helper():
+    return 1
+'''
+
+
+def test_func_by_name_bare_first_match_unchanged():
+    src = flowedit.py_func_source_by_name(_COLLISION_TEXT, "__init__")
+    assert src is not None and "method_name" in src   # first __init__ wins
+
+
+def test_func_by_name_class_scoped_picks_right_class():
+    src = flowedit.py_func_source_by_name(_COLLISION_TEXT,
+                                          "DisplaySend.__init__")
+    assert src is not None
+    assert "self.method = method" in src
+    assert "method_name" not in src
+
+
+def test_func_by_name_new_class_scope_returns_none():
+    # THE 322d7a regression: a brand-new class's __init__ must NOT match the
+    # legacy classes' __init__ at HEAD.
+    assert flowedit.py_func_source_by_name(
+        _COLLISION_TEXT, "SolrUpdateState.__init__") is None
+
+
+def test_func_by_name_module_qualifier_falls_back():
+    src = flowedit.py_func_source_by_name(_COLLISION_TEXT,
+                                          "pkg.module.helper")
+    assert src is not None and "return 1" in src
+
+
+def test_addfn_locate_keeps_class_qualifier():
+    from servers.common import flowedit_tools as fe
+    rel, name = fe._addfn_locate({
+        "op": "add_function", "function": "SolrUpdateState.__init__",
+        "anchor": "openlibrary/solr/update_work.py:100"})
+    assert rel == "openlibrary/solr/update_work.py"
+    assert name == "SolrUpdateState.__init__"
+
+
+def test_plan_add_function_new_class_init_no_false_preexisting(monkeypatch):
+    from servers.common import flowedit_tools as fe
+    monkeypatch.setattr(flowedit, "git_head_text",
+                        lambda rel: (_COLLISION_TEXT, "head"))
+    entry = {"op": "add_function", "function": "SolrUpdateState.__init__",
+             "anchor": "openlibrary/solr/update_work.py:100"}
+    problems = []
+    fe._plan_add_function(entry, problems)
+    assert entry["expected_new"] is True          # was False (the false alarm)
+    assert problems == []
+
+
+def test_plan_add_function_bare_name_still_warns(monkeypatch):
+    from servers.common import flowedit_tools as fe
+    monkeypatch.setattr(flowedit, "git_head_text",
+                        lambda rel: (_COLLISION_TEXT, "head"))
+    entry = {"op": "add_function", "function": "helper",
+             "anchor": "openlibrary/solr/update_work.py:100"}
+    problems = []
+    fe._plan_add_function(entry, problems)
+    assert entry["expected_new"] is False         # genuinely exists at HEAD
+    assert problems and "already exists" in problems[0]
+
+
+# --- 2026-08-14 tools-v2 additions: renderer honesty + module expansion -------
+
+
+def test_render_def_use_header_counts_full_set():
+    """Header counts must come from the FULL pair set: counting the truncated
+    grouping undercounted defs whenever max_pairs elided rows."""
+    pairs = [("v%d" % i, i + 1, i + 2) for i in range(10)]
+    text = flowedit.render_def_use("f", pairs, lambda _l: "", "beniget",
+                                   max_pairs=3)
+    assert "[10 vars, 10 defs, 10 def->use pairs" in text
+    assert "(7 more pairs)" in text
+
+
+def test_module_function_specs_expands_module_paths(monkeypatch):
+    from servers.cfg_server import server as cfg_srv
+    rows = [
+        {"file": "lib/ansible/galaxy/login.py", "qualname": "GalaxyLogin.create_github_token", "name": "create_github_token", "line": 30},
+        {"file": "lib/ansible/galaxy/login.py", "qualname": "top_helper", "name": "top_helper", "line": 10},
+        {"file": "lib/ansible/galaxy/api.py", "qualname": "other", "name": "other", "line": 5},
+    ]
+    monkeypatch.setattr(cfg_srv, "_load_function_rows", lambda: rows)
+    specs = flowedit.module_function_specs("galaxy.login")
+    assert specs == ["lib/ansible/galaxy/login.py:10"]   # top-level preferred
+    assert flowedit.module_function_specs("galaxy.nosuch") == []
+
+
+def test_resolve_functions_file_name_form(monkeypatch):
+    """'pkg/mod.py:func_name' resolves the name WITHIN the file (used to fall
+    through to global matching and miss)."""
+    from servers.cfg_server import server as cfg_srv
+    rows = [
+        {"file": "pkg/hardware/linux.py", "qualname": "LinuxHardware.get_mount_facts", "name": "get_mount_facts", "line": 567, "end_line": 640},
+        {"file": "pkg/hardware/aix.py", "qualname": "AixHardware.get_mount_facts", "name": "get_mount_facts", "line": 188, "end_line": 230},
+    ]
+    monkeypatch.setattr(cfg_srv, "_load_function_rows", lambda: rows)
+    got = cfg_srv._resolve_functions("pkg/hardware/linux.py:get_mount_facts")
+    assert len(got) == 1 and got[0]["file"] == "pkg/hardware/linux.py"
+
+
+def test_c_func_by_name_qualified_class_scoping():
+    """C++ analog of the name-collision fix: 'B::run' must extract B's run,
+    not A's, even though A::run appears first in the file."""
+    text = (
+        "void A::run(int x) {\n"
+        "    a_stuff();\n"
+        "}\n"
+        "void B::run(int x) {\n"
+        "    b_stuff();\n"
+        "}\n"
+        "static int run(int y) {\n"
+        "    plain_stuff();\n"
+        "}\n"
+    )
+    src = flowedit.c_func_source_by_name(text, "B::run")
+    assert src is not None and "b_stuff" in src and "a_stuff" not in src
+    # bare form: unchanged behavior -- matches the plain-C definition
+    bare = flowedit.c_func_source_by_name(text, "run")
+    assert bare is not None and "plain_stuff" in bare

@@ -108,6 +108,20 @@ class ModuleDFG:
             chains = _QuietDefUseChains(rel_path)
             chains.visit(tree)
 
+        # except-handler bindings: gast synthesizes the `except X as e` Name
+        # WITHOUT a source location, so its def was dropped below (line is
+        # None) and handler dataflow vanished from both the def-use tables
+        # and the dfg fingerprint (2026-08-14 audit: 5 of 9 cells).
+        # Recover the def line from the enclosing handler node.
+        handler_name_lines: dict[int, int] = {}
+        for _n in gast.walk(tree):
+            if isinstance(_n, gast.ExceptHandler) and _n.name is not None:
+                _nm = _n.name
+                if isinstance(_nm, gast.Name) \
+                        and getattr(_nm, "lineno", None) is None \
+                        and getattr(_n, "lineno", None) is not None:
+                    handler_name_lines[id(_nm)] = _n.lineno
+
         # (var, def_line, use_line) def/use pairs from the beniget chains.
         pairs: set[tuple[str, int, int]] = set()
         defs: set[Anchor] = set()
@@ -119,6 +133,8 @@ class ModuleDFG:
             elif not isinstance(node, _NAMED_DEF_TYPES):
                 continue
             line = getattr(node, "lineno", None)
+            if line is None:
+                line = handler_name_lines.get(id(node))
             if line is None:
                 continue
             var = definition.name()

@@ -14,7 +14,6 @@ swebench_pro adapter; kept self-contained so it runs from this repo.
 """
 
 import json
-import os
 import re
 import shutil
 import subprocess
@@ -22,11 +21,8 @@ from pathlib import Path
 from typing import Any
 
 DOCKER_REGISTRY = "jefzda/sweap-images"
-# Override with the SWEBENCH_PRO_HARNESS env var if the official harness clone
-# lives elsewhere.
-OFFICIAL_HARNESS = Path(os.environ.get(
-    "SWEBENCH_PRO_HARNESS",
-    "/home/tempadmin/code_rep_data/swebench_pro/official_harness"))
+OFFICIAL_HARNESS = Path(
+    "/home/tempadmin/code_rep_data/swebench_pro/official_harness")
 
 
 def _strip_binary_hunks(diff: str) -> str:
@@ -109,12 +105,7 @@ def grade(inst: dict[str, Any], run_dir: Path, *, harness: Path = OFFICIAL_HARNE
         parser_py = (rs_dir / "parser.py").read_text("utf-8", errors="replace")
         entry = _create_entryscript(inst, harness)
     except FileNotFoundError as e:
-        extra = {"error": str(e)}
-        if not Path(harness).is_dir():
-            extra["hint"] = ("official harness dir not found at %s -- set the "
-                             "SWEBENCH_PRO_HARNESS env var to its location"
-                             % harness)
-        return _fail("harness_files_missing", extra)
+        return _fail("harness_files_missing", {"error": str(e)})
 
     ws = run_dir / "_grader_ws"
     if ws.exists():

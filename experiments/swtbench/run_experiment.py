@@ -6,17 +6,16 @@ plumbing; the task-specific pieces are: the test-gen prompt (prompt.py), a
 TEST-ONLY diff harvest, and the two-run SWT grader (grade.py).
 
 Conditions:
-  baseline             -- no tools, plain test-gen prompt.
-  cfg_perrep_flow3     -- flow3: the agent works in the buggy function's CFG
-                          (flow_of/flow_plan/flow_check/flow_verify), no map.
-  dfg_perrep_flow3     -- flow3: same, but the buggy function's DEF-USE
-                          (value-flow) graph instead of the CFG.
-  cfgdfg_perrep_flow3  -- flow3: BOTH graphs.
+  baseline        -- no tools, plain test-gen prompt.
+  cfg_perrep_flow -- flow-first: the agent works in the buggy function's CFG
+                     (flow_of/flow_plan/flow_check), no code map.
+  dfg_perrep_flow -- flow-first: same, but the buggy function's DEF-USE
+                     (value-flow) graph instead of the CFG (Python/beniget).
 
 Usage:
   python -m experiments.swtbench.run_experiment \
     --ids-file results/_flowpilot_ids.json \
-    --conditions baseline cfg_perrep_flow3 \
+    --conditions baseline cfg_perrep_flow \
     --exp-name swt10 --concurrency 2 --grade
 """
 
@@ -25,6 +24,7 @@ from __future__ import annotations
 import argparse
 import concurrent.futures as cf
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -38,9 +38,6 @@ from experiments.swtbench import prompt as swt_prompt  # noqa: E402
 from experiments.swtbench import grade as swt_grade  # noqa: E402
 
 CLAUDE_BIN = swe.CLAUDE_BIN
-
-ALLOWED_CONDITIONS = {"baseline", "cfg_perrep_flow3", "dfg_perrep_flow3",
-                      "cfgdfg_perrep_flow3"}
 
 
 # -- test-only diff harvest ---------------------------------------------------
@@ -90,9 +87,12 @@ def harvest_test_patch(inst: dict, wt: Path) -> str:
 def condition_flow_v3(condition: str) -> bool:
     """flow3 (v3) test-gen arm: '<rep>_perrep_flow3' (cfg/dfg/cfgdfg).
 
-    Map-free flow surface + TESTGEN server semantics, plus REPR_FLOW_V3=1
+    A NEW ARM (the v2 '_perrep_flow' conditions stay byte-identical): same
+    map-free flow surface + TESTGEN server semantics, plus REPR_FLOW_V3=1
     (add_function op, fault_site, HEAD snapshots, merge-on-replan, graded
-    verdicts), NO legacy-verify pin, and the flowfix-skill protocol prompt."""
+    verdicts), NO legacy-verify pin, and the flowfix-skill protocol prompt.
+    Exact-membership check so it is never confused with the v2 conditions
+    ('_perrep_flow' is a PREFIX of '_perrep_flow3')."""
     return condition in ("cfg_perrep_flow3", "dfg_perrep_flow3",
                          "cfgdfg_perrep_flow3")
 
@@ -115,10 +115,13 @@ def run_cell(inst: dict, condition: str, results_dir: Path, args) -> dict:
                 "resolved": False, "_token_skipped": True}
     run_dir.mkdir(parents=True, exist_ok=True)
 
-    # flow3: cfg = control-flow blocks/edges, dfg = def-use value flow,
+    # flow-first: cfg = control-flow blocks/edges, dfg = def-use value flow,
     # cfgdfg = BOTH graphs (the combined arm). All Python here
     # (beniget/stdlib-ast engines; no Joern needed).
-    rep = None
+    flow_first = condition in ("cfg_perrep_flow", "dfg_perrep_flow",
+                               "cfgdfg_perrep_flow")
+    rep = condition.split("_", 1)[0] if flow_first else None
+    # flow3 (v3): a NEW arm -- the v2 branches above stay untouched.
     flow_v3 = condition_flow_v3(condition)
     if flow_v3:
         rep = condition.split("_", 1)[0]
@@ -127,6 +130,21 @@ def run_cell(inst: dict, condition: str, results_dir: Path, args) -> dict:
         wt = checkout.prepare_worktree(inst, suffix=condition)
         mcp_config = None
         flow_first_tools = None
+        if flow_first:
+            # symbol index (so flow_of resolves the report's symbols); NO map.
+            swe.ensure_repr_index(inst, wt, rep=rep)
+            # TEST-GEN mode: flow_plan records the delta a FIX would make
+            # (the contract the test asserts is missing); flow_check /
+            # flow_verify prove the SOURCE flow is untouched and the diff is
+            # test-files-only. All three verification tools are REQUIRED by
+            # the prompt (v2 fix: they were optional and unused).
+            mcp_config = swe.write_mcp_config(rep, wt, run_dir,
+                                              flow_first=True,
+                                              flow_testgen=True)
+            flow_first_tools = ("mcp__%s_perrep__flow_of" % rep,
+                                "mcp__%s_perrep__flow_plan" % rep,
+                                "mcp__%s_perrep__flow_check" % rep,
+                                "mcp__%s_perrep__flow_verify" % rep)
         if flow_v3:
             # flow3: same symbol-index-only, map-free setup as flow_first;
             # server runs in TESTGEN mode PLUS REPR_FLOW_V3=1 (and without
@@ -161,15 +179,29 @@ def run_cell(inst: dict, condition: str, results_dir: Path, args) -> dict:
                                                           tools3)
         flow3_sentinel = flow_protocol.SENTINEL
 
-    agent.run_agent(
-        inst, run_dir, claude_bin=args.claude_bin, worktree=wt,
-        model=args.model, effort=args.effort_flag,
-        max_turns=args.max_turns,
-        max_budget_usd=args.max_budget_usd,
-        timeout_sec=args.timeout_sec, mcp_config=mcp_config,
-        restrict_tools=(mcp_config is not None),
-        flow_first_tools=flow_first_tools, prompt_override=prompt,
-        skill_md=flow3_skill_md, sentinel=flow3_sentinel)
+    if args.agent == "claude":
+        agent.run_agent(
+            inst, run_dir, claude_bin=args.claude_bin, worktree=wt,
+            model=args.model, effort=args.effort_flag,
+            max_turns=args.max_turns,
+            max_budget_usd=args.max_budget_usd,
+            timeout_sec=args.timeout_sec, mcp_config=mcp_config,
+            restrict_tools=(mcp_config is not None),
+            flow_first_tools=flow_first_tools, prompt_override=prompt,
+            skill_md=flow3_skill_md, sentinel=flow3_sentinel)
+    else:
+        from experiments.common import codex_agent
+        codex_agent.run_agent(
+            inst, run_dir, codex_bin=args.codex_bin, worktree=wt,
+            model=args.model, effort=args.effort_flag,
+            max_turns=args.max_turns,
+            max_budget_usd=args.max_budget_usd,
+            timeout_sec=args.timeout_sec, prompt=prompt,
+            mcp_config=mcp_config, skill_md=flow3_skill_md,
+            sentinel=flow3_sentinel,
+            auth_file=(Path(args.codex_auth_file)
+                       if args.codex_auth_file else None),
+            auth_mode=args.codex_auth_mode)
 
     # flow3 ONLY: runner-side final plan-vs-code verdict (the v2 SWT cells
     # never had this harness-side record; adding it v3-only keeps them
@@ -187,7 +219,18 @@ def run_cell(inst: dict, condition: str, results_dir: Path, args) -> dict:
 
     rec = {"instance_id": iid, "condition": condition, "rep": rep,
            "test_patch_bytes": len(test_patch)}
-    if args.grade:
+    ds = getattr(args, "dataset", "pro")
+    if ds in ("lite", "verified"):
+        # lite/verified: swt_grade.grade is SWE-Pro-docker-specific
+        # (dockerhub_tag), so grading is DEFERRED to the official SWT-bench
+        # harness via grade_official.py, which later merges real verdicts
+        # into this file. The stub is LOAD-BEARING for resume: cells key
+        # done-ness on grade.json existing (see the top of run_cell).
+        g = {"instance_id": iid, "condition": condition, "dataset": ds,
+             "pending_official": True, "resolved": None}
+        (run_dir / "grade.json").write_text(json.dumps(g), "utf-8")
+        rec.update(g)
+    elif args.grade:
         if not test_patch.strip():
             g = {"resolved": False, "score": 0.0, "reason": "no_test_patch"}
             (run_dir / "grade.json").write_text(json.dumps(g), "utf-8")
@@ -206,25 +249,50 @@ def main(argv=None):
     p.add_argument("--instance-ids", nargs="*", default=None)
     p.add_argument("--ids-file", default=None)
     p.add_argument("--conditions", nargs="+",
-                   default=["baseline", "cfg_perrep_flow3"])
+                   default=["baseline", "cfg_perrep_flow"])
     p.add_argument("--exp-name", default="swtbench")
     p.add_argument("--concurrency", type=int, default=2)
-    p.add_argument("--agent", choices=["claude"], default="claude")
-    p.add_argument("--model", default="claude-haiku-4-5")
+    p.add_argument("--agent", choices=["claude", "codex"], default="claude")
+    p.add_argument("--model", default=None)
     p.add_argument("--effort-flag", default="low")
     p.add_argument("--max-turns", type=int, default=80)
     p.add_argument("--max-budget-usd", type=float, default=2.0)
     p.add_argument("--timeout-sec", type=int, default=1500)
     p.add_argument("--claude-bin", default=CLAUDE_BIN)
+    p.add_argument("--codex-bin", default=os.environ.get("REPR_CODEX_BIN",
+                                                         "codex"))
+    p.add_argument("--codex-auth-file", default=None)
+    p.add_argument("--codex-auth-mode", choices=["auto", "chatgpt", "api-key"],
+                   default="auto")
     p.add_argument("--grade", action="store_true")
     p.add_argument("--force", action="store_true")
     p.add_argument("--keep-worktrees", action="store_true")
+    p.add_argument("--dataset", default="pro", choices=["pro", "lite", "verified"],
+                   help="which benchmark: 'pro' (SWE-bench Pro, default; SWT "
+                        "grading via the SWE-Pro docker grader), 'lite' "
+                        "(official SWE-bench Lite -- classic schema; grading "
+                        "deferred to grade_official.py, cells write a "
+                        "pending-official stub grade.json), or 'verified' "
+                        "(official SWE-bench Verified -- same deferred-official "
+                        "grading path as lite)")
     a = p.parse_args(argv)
-    bad = sorted(set(a.conditions) - ALLOWED_CONDITIONS)
-    if bad:
-        raise SystemExit(
-            "unsupported condition(s): %s -- allowed: %s"
-            % (", ".join(bad), ", ".join(sorted(ALLOWED_CONDITIONS))))
+    if a.model is None:
+        a.model = ("gpt-5.4-mini" if a.agent == "codex"
+                   else "claude-haiku-4-5")
+
+    # dataset swap (same precedent as swebench_pro.run_experiment --dataset
+    # verified): 'lite' rebinds this module's `instances` global to the
+    # official SWE-bench Lite loader (classic schema: no dockerhub_tag /
+    # before_repo_set_cmd / requirements / interface -- prompt.py drops the
+    # missing sections silently). Import is LAZY: the lite module is being
+    # built in parallel, and the default 'pro' path must never touch it.
+    global instances
+    if a.dataset == "lite":
+        from experiments.swebench_lite import instances as _linst
+        instances = _linst
+    elif a.dataset == "verified":
+        from experiments.swebench_verified import instances as _vinst
+        instances = _vinst
 
     ids = a.instance_ids
     if a.ids_file:

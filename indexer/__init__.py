@@ -1,7 +1,6 @@
-"""Offline index construction for the flow servers.
+"""Offline index construction for the repr-study servers.
 
-The runners build the symbols index per instance via
-``indexer.backends.get_backend("symbols")`` (see ensure_repr_index in the
-benchmark runners); it resolves the bug report's function names to their
-definitions so ``flow_of`` can find the right graphs.
+``python -m indexer.build_index --repo R --index-dir I --reps a,b`` builds the
+manifest (staleness baseline) and the symbols backend, then each requested
+backend from indexer/backends/. See INTERFACES.md section 7.
 """

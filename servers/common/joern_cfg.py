@@ -23,12 +23,10 @@ from collections import Counter
 from pathlib import Path
 from typing import Optional
 
-JOERN_CLI = Path(os.environ.get("JOERN_CLI_DIR",
-                                str(Path.home() / "tools" / "joern-cli")))
+JOERN_CLI = Path.home() / "tools" / "joern-cli"
 C2CPG = JOERN_CLI / "c2cpg.sh"
 JOERN = JOERN_CLI / "joern"
-JDK_HOME = Path(os.environ.get("JOERN_JAVA_HOME",
-                               str(Path.home() / "tools" / "jdk-21.0.5+11")))
+JDK_HOME = Path.home() / "tools" / "jdk-21.0.5+11"
 
 C_EXTS = {".c", ".cc", ".cpp", ".cxx", ".h", ".hpp", ".hh", ".hxx"}
 

@@ -145,6 +145,15 @@ class _Builder:
         self.edges: list[dict] = []
         self._edge_keys: set[tuple[int, int, str]] = set()
         self._loops: list[dict] = []
+        # enclosing try/finally finalbodies (innermost last): a Return/Raise
+        # must route THROUGH them before reaching exit (2026-08-14 audit fix:
+        # return edges used to bypass `finally`, and an all-abrupt try left
+        # its shared finalbody block disconnected)
+        self._finals: list[list] = []
+        # blocks created by inlining a finalbody copy on a Return/Raise path:
+        # excluded from a Try's "guarded may-raise" set (an exception in a
+        # finally propagates OUT of the try, not into its own handlers)
+        self._final_copy_blocks: set[int] = set()
         self.entry = self._new_block()
         self.exit = self._new_block()
 
@@ -247,9 +256,12 @@ class _Builder:
                 self._span(current, stmt.lineno, stmt.lineno)
                 head = current
                 first_new = len(self.blocks)
+                if stmt.finalbody:
+                    self._finals.append(stmt.finalbody)
                 body_exits = self.process(stmt.body, [(head, "next")])
                 guarded = [head] + [
                     block["id"] for block in self.blocks[first_new:]
+                    if block["id"] not in self._final_copy_blocks
                 ]
                 handler_exits: list[tuple[int, str]] = []
                 for handler in stmt.handlers:
@@ -263,9 +275,19 @@ class _Builder:
                     )
                 if stmt.orelse:
                     body_exits = self.process(stmt.orelse, body_exits)
+                if stmt.finalbody:
+                    self._finals.pop()
                 preds = body_exits + handler_exits
                 if stmt.finalbody:
-                    preds = self.process(stmt.finalbody, preds)
+                    if preds:
+                        preds = self.process(stmt.finalbody, preds)
+                    else:
+                        # every path through body/handlers exited abruptly:
+                        # each Return/Raise already routed through its own
+                        # inlined copy of the finalbody -- processing the
+                        # shared finalbody here would create a DISCONNECTED
+                        # block (the audited `start()` artifact)
+                        preds = []
                 current = None
             elif isinstance(stmt, (ast.With, ast.AsyncWith)):
                 current = self._ensure(current, preds)
@@ -291,7 +313,24 @@ class _Builder:
                 self._span(
                     current, stmt.lineno, getattr(stmt, "end_lineno", stmt.lineno)
                 )
-                self._edge(current, self.exit, "next")
+                # route through every enclosing finalbody (innermost first),
+                # INLINING a copy per abrupt exit -- Python semantics: a
+                # return/raise inside try/finally executes the finally suite
+                # before leaving. A return inside a finalbody copy threads
+                # only the finals OUTSIDE it (hence the truncated stack).
+                outs: list[tuple[int, str]] = [(current, "next")]
+                finals = list(self._finals)
+                copy_start = len(self.blocks)
+                for i in range(len(finals) - 1, -1, -1):
+                    saved = self._finals
+                    self._finals = finals[:i]
+                    try:
+                        outs = self.process(finals[i], outs)
+                    finally:
+                        self._finals = saved
+                self._final_copy_blocks.update(
+                    b["id"] for b in self.blocks[copy_start:])
+                self._connect(outs, self.exit)
                 current = None
                 preds = []
             elif isinstance(stmt, ast.Break):

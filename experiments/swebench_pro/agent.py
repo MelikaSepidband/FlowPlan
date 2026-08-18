@@ -1,13 +1,14 @@
 """Run the claude agent on one SWE-bench Pro instance (host worktree).
 
 The agent runs with cwd = the instance worktree and ``bypassPermissions`` so it
-can EDIT files. It is told to fix the bug described in ``problem_statement`` so
-the failing tests pass; it must NOT edit the test files. We then extract its
-patch as the worktree diff (excluding the harness-laid test files).
+can EDIT files (unlike LinuxFLBench, where it only read + emitted JSON). It is
+told to fix the bug described in ``problem_statement`` so the failing tests pass;
+it must NOT edit the test files. We then extract its patch as the worktree diff
+(excluding the harness-laid test files).
 
-Invocation conventions: ``claude -p`` with ``--output-format json``, a per-run
-``CLAUDE_CONFIG_DIR`` seeded from the user's credentials, optional
-``--mcp-config`` for the flow server, token-freshness guard.
+Reuses the linuxflbench claude-invocation conventions: ``claude -p`` with
+``--output-format json``, a per-run ``CLAUDE_CONFIG_DIR`` seeded from the user's
+credentials, optional ``--mcp-config`` for a rep server, token-freshness guard.
 """
 
 import json

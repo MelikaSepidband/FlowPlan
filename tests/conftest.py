@@ -16,8 +16,7 @@ _REPO_TOP = Path(__file__).resolve().parent.parent
 if str(_REPO_TOP) not in sys.path:
     sys.path.insert(0, str(_REPO_TOP))
 
-from indexer.backends import get_backend  # noqa: E402
-from indexer.manifest import build_manifest  # noqa: E402
+from indexer import build_index as build_index_mod  # noqa: E402
 
 FIXTURE_REPO = Path(__file__).resolve().parent / "fixtures" / "sampleproj"
 
@@ -50,25 +49,9 @@ def fixture_repo() -> Path:
 def built_index(
     tmp_path_factory: pytest.TempPathFactory, fixture_repo: Path
 ) -> BuiltIndex:
-    """Manifest + symbols backend built over the fixture repo in a tmp dir.
-
-    (This export ships no indexer.build_index CLI; the fixture reproduces its
-    reps=[] behavior directly: manifest for staleness + the symbols backend.)
-    """
+    """Manifest + symbols backend built over the fixture repo in a tmp dir."""
     index_dir = tmp_path_factory.mktemp("repr_index")
-    manifest = build_manifest(fixture_repo, index_dir)
-    stats = {
-        "repo": str(fixture_repo),
-        "index_dir": str(index_dir),
-        "manifest": {
-            "files": len(manifest["files"]),
-            "built_at": manifest["built_at"],
-            "commit": manifest["commit"],
-        },
-        "backends": {
-            "symbols": get_backend("symbols").build(fixture_repo, index_dir)
-        },
-    }
+    stats = build_index_mod.build(repo=fixture_repo, index_dir=index_dir, reps=[])
     return BuiltIndex(repo_root=fixture_repo, index_dir=index_dir, stats=stats)
 
 

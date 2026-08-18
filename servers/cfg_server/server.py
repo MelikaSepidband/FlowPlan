@@ -26,6 +26,7 @@ generation (INTERFACES.md section 8).
 """
 
 import itertools
+import re
 import sqlite3
 import time
 from pathlib import Path
@@ -476,6 +477,17 @@ def _resolve_functions(spec: str, file: Optional[str] = None) -> list[dict]:
         if containing:
             return [max(containing, key=lambda row: row["line"])]
         raise ValueError(f"no function found at anchor {text!r}")
+    # file-scoped NAME form ('pkg/mod.py:func_name'): a natural agent request
+    # (the anchor form with a name instead of a line) that used to fall
+    # through to GLOBAL name matching and miss (2026-08-14 audit: the target
+    # existed in the named file). Resolve the name restricted to that file.
+    if ":" in text and "::" not in text:
+        path_part, _, name_part = text.rpartition(":")
+        src_exts = (".py", ".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp")
+        if (path_part and name_part and not name_part.isdigit()
+                and path_part.replace("\\", "/").lower().endswith(src_exts)
+                and re.fullmatch(r"[A-Za-z_][\w.]*", name_part)):
+            return _resolve_functions(name_part, file=path_part)
     matches: list[dict] = []
     seen: set[tuple[str, int]] = set()
 
