@@ -36,7 +36,7 @@ test generation (SWT-bench protocol), and C security patching (SecBench).
 | benchmark | task | language | instances |
 |---|---|---|---|
 | SWE-bench Pro | bug repair | Python | `samples/swebench_pro_n253` (253) |
-| SWT-bench Verified | test generation | Python | a 204-instance sample (95% confidence, ±5% margin) — `data/ids/swt_verified_204.json`, drawn stratified-by-repo from the official 433-id split (`swt_verified_433.json`); instances load from the official SWE-bench Verified HF parquet |
+| SWT-bench Verified | test generation | Python | `samples/swtbench_verified_n204` (204) |
 | SecBench | security patch (sanitizer crash) | C/C++ | `samples/secbench_patch_n169` (169) |
 
 **About the test-generation benchmark:** we follow the official
@@ -55,8 +55,10 @@ The subsets we ran are in `data/ids/`. SWE-bench Pro: all 253, run as
 `swe_70.json` (first tranche, built 30 + 20 + 20) then `swe_183_rest.json`
 (the remainder). Test generation: a stratified-by-repo random sample of 204 of
 the 433 (`swt_verified_204.json`; 204 ≈ the finite-population n for a ±5%
-margin at 95% confidence), run in batches — `swt_verified_50.json` first (a
-stratified 50-subset containing the `swt_verified_pilot10.json` pilot).
+margin at 95% confidence), shipped in full as
+`samples/swtbench_verified_n204` and run in batches — `swt_verified_50.json`
+first (a stratified 50-subset containing the `swt_verified_pilot10.json`
+pilot).
 SecBench: `sec_166.json` (166 of the 169; `sec_50.json` was the first
 tranche). The `swt_30/swt_50/swt_20b.json` lists are the superseded early
 design (SWT protocol over SWE-bench Pro instances; `--dataset pro` still
@@ -82,13 +84,14 @@ leaderboard and are not part of the headline results).
   (its `run_scripts/<instance>/` and `dockerfiles/`), pointed to by
   `SWEBENCH_PRO_HARNESS`. Grading docker images (`jefzda/sweap-images:<tag>`,
   `hwiwonlee/secb.eval.x86_64.<id>`) are pulled on demand.
-- **SWT-bench Verified only:** (a) the `princeton-nlp/SWE-bench_Verified`
-  dataset in the HF hub cache (`~/.cache/huggingface`; one
-  `huggingface-cli download princeton-nlp/SWE-bench_Verified --repo-type
-  dataset` beforehand — the loader reads the parquet directly, no `datasets`
-  dep), and (b) for grading, an external clone of the official
+- **SWT-bench Verified only:** grading needs an external clone of the official
   [swt-bench harness](https://github.com/logic-star-ai/swt-bench) with its own
-  venv (pass `--harness-root`; it builds its eval images locally).
+  venv (pass `--harness-root`; it builds its eval images locally). The shipped
+  `samples/swtbench_verified_n204` covers the whole 204-sample; only ids
+  outside it additionally need the `princeton-nlp/SWE-bench_Verified` dataset
+  in the HF hub cache (`huggingface-cli download
+  princeton-nlp/SWE-bench_Verified --repo-type dataset` — the loader reads the
+  parquet directly, no `datasets` dep).
 
 ## Setup
 
