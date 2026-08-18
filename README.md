@@ -36,7 +36,7 @@ test generation (SWT-bench protocol), and C security patching (SecBench).
 | benchmark | task | language | instances |
 |---|---|---|---|
 | SWE-bench Pro | bug repair | Python | `samples/swebench_pro_n253` (253) |
-| SWT-bench Verified | test generation | Python | official SWE-bench Verified (HF parquet, auto-detected in `~/.cache/huggingface`); the official SWT-bench filter keeps 433 ids — `data/ids/swt_verified_433.json` |
+| SWT-bench Verified | test generation | Python | a 204-instance sample (95% confidence, ±5% margin) — `data/ids/swt_verified_204.json`, drawn stratified-by-repo from the official 433-id split (`swt_verified_433.json`); instances load from the official SWE-bench Verified HF parquet |
 | SecBench | security patch (sanitizer crash) | C/C++ | `samples/secbench_patch_n169` (169) |
 
 **About the test-generation benchmark:** we follow the official
