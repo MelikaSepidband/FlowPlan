@@ -6,3 +6,7 @@ results/
 *.log
 *.egg-info/
 .DS_Store
+# Joern CPG scratch output (not needed) + third-party clones for the
+# related-work arms (pinned in related_works/README.md)
+workspace/
+third_party/
