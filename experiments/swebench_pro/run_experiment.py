@@ -7,8 +7,18 @@ in Docker (apply patch + run fail_to_pass/pass_to_pass). Score = resolved or not
 
 Conditions:
   baseline                          -- claude alone, no MCP servers
-  <rep>_perrep   (ast/callgraph/    -- our fixed perrep server for <rep>
-   deps/docs/hybrid)                   (the trimmed "new" versions)
+  <rep>_perrep_flow3 (cfg/dfg/      -- the flow arms (five flow tools, /flowfix
+   cfgdfg)                             skill); see README
+  related-work arms (see related_works/README.md), all on plain Claude Code:
+    baseline_noexec    "To Run or Not to Run" (2606.26978): prohibited-execution
+                       sentence appended to the task prompt; run with the test
+                       shim OFF (dependencies not installed), as in the paper
+    baseline_prunerB   SWE-Pruner (2601.16746): their skimmer + template, bash-only
+    baseline_csniper   ContextSniper (2607.01916): their Claude Code plugin + policy
+    baseline_cbmem2    Codebase-Memory MCP (2603.27277): the tool as its installer
+                       configures Claude Code (skill, agents, hooks), pre-indexed
+    baseline_agentsmd  AGENTS.md study (2601.20404): ~1,000-word repo-root CLAUDE.md
+    baseline_cmv2      CMV (2602.22402): their trim hooks + the stop-and-resume relay
 
 Usage:
   .venv/bin/python -m experiments.swebench_pro.run_experiment \\
@@ -41,6 +51,78 @@ PERREP_REPS = ("ast", "callgraph", "deps", "docs", "hybrid", "cfg", "dfg",
 # target instance_id -> injected cross-instance memory block (populated in main()
 # when the 'memory_hybrid' condition is requested; empty dict otherwise).
 _MEMORY_BLOCKS: dict[str, str] = {}
+
+# -- related-work arms (published token-reduction methods run on Claude Code) --
+RELATED_WORK_CONDITIONS = {
+    "baseline_noexec", "baseline_prunerB", "baseline_csniper",
+    "baseline_cbmem2", "baseline_agentsmd", "baseline_cmv2",
+}
+# "To Run or Not to Run" (arXiv 2606.26978, ISSTA'26): their PRIMARY
+# prohibited-execution enforcement is this prompt-level sentence (verbatim).
+# The paper's Prohibited condition ALSO has dependencies uninstalled: run this
+# arm with REPR_TEST_SHIM unset so the worktree has no pytest / no deps.
+_NOEXEC_CLAUSE = ("Do not run pytest, unittest, or project test scripts. "
+                  "Project dependencies are not installed.")
+
+
+def _claudemd_for(iid: str) -> Path:
+    """Instance id -> the per-repo AGENTS.md-sized CLAUDE.md
+    (tools/claudemd_full/<owner>__<repo>.md) for baseline_agentsmd."""
+    import re as _re
+    m = _re.match(r"instance_(.+?)-[0-9a-f]{40}-v[0-9a-f]+$", iid)
+    if not m:
+        raise RuntimeError("cannot derive repo from instance id %r" % iid)
+    p = agent.CLAUDEMD_FULL_DIR / (m.group(1) + ".md")
+    if not p.exists():
+        raise RuntimeError("no CLAUDE.md authored for repo %r" % m.group(1))
+    return p
+
+
+_CSNIPER_POLICY_CACHE = None
+
+
+def _csniper_policy() -> str:
+    """Render ContextSniper's code-policy text exactly as their released
+    Claude runner does (contextsniper-render-code-policy with the filtering
+    section enabled). Static per config -- rendered once and cached."""
+    global _CSNIPER_POLICY_CACHE
+    if _CSNIPER_POLICY_CACHE is None:
+        env = dict(os.environ)
+        env["PY_BIN"] = str(agent.CSNIPER_ROOT / ".venv" / "bin" / "python")
+        env["CONTEXTSNIPER_DIR"] = str(agent.CSNIPER_ROOT)
+        env["CONTEXTSNIPER_INJECT_FILTERING_PROMPT"] = "1"
+        out = subprocess.run(
+            [str(agent.CSNIPER_PLUGIN / "bin"
+                 / "contextsniper-render-code-policy")],
+            capture_output=True, text=True, env=env, timeout=60)
+        if out.returncode != 0 or not out.stdout.strip():
+            raise RuntimeError("csniper policy render failed: %s"
+                               % out.stderr[:300])
+        _CSNIPER_POLICY_CACHE = out.stdout.strip()
+    return _CSNIPER_POLICY_CACHE
+
+
+def _cbmem_index(inst: dict, wt: Path, run_dir: Path) -> list[str]:
+    """baseline_cbmem2: pre-index the worktree with the tool's own CLI under
+    a SHORT project name (--name <repo>; the tool echoes the project name on
+    every qualified name it returns). Per-cell cache/runtime dirs; the
+    runtime dir holds a unix socket so it must be a short path."""
+    import hashlib as _hl
+    cbm_rt = Path("/tmp/cbmrt_%s" % _hl.md5(str(run_dir).encode()).hexdigest()[:10])
+    (run_dir / "cbm_cache").mkdir(parents=True, exist_ok=True)
+    cbm_rt.mkdir(parents=True, exist_ok=True)
+    idx_env = dict(os.environ)
+    idx_env["CBM_CACHE_DIR"] = str(run_dir / "cbm_cache")
+    idx_env["CBM_RUNTIME_DIR"] = str(cbm_rt)
+    idx_env["CBM_ALLOWED_ROOT"] = str(wt)
+    idx_cmd = [str(agent.CBMEM_BIN), "cli", "index_repository",
+               "--repo-path", str(wt),
+               "--name", (inst.get("repo") or "repo").split("/")[-1]]
+    r = subprocess.run(idx_cmd, env=idx_env, capture_output=True, text=True,
+                       timeout=900)
+    (run_dir / "cbmem_index.log").write_text(
+        (r.stdout or "") + "\n---\n" + (r.stderr or ""), encoding="utf-8")
+    return idx_cmd
 
 # External-tool baseline: colbymchenry/codegraph, run with ITS OWN whole-tree
 # .codegraph/ index + Node MCP server (mirrors the LinuxFLBench 'codegraph'
@@ -542,6 +624,28 @@ def run_cell(inst: dict, condition: str, results_dir: Path, args) -> dict:
         (run_dir / "memory_injected.txt").write_text(
             block or "(no memory retrieved)", encoding="utf-8")
 
+    # -- related-work arms: prompt-level pieces (one thing changed vs baseline)
+    comparator_prompt_override = None
+    if condition == "baseline_noexec":
+        comparator_prompt_override = (
+            agent.build_prompt(inst) + "\n\n" + _NOEXEC_CLAUSE)
+        (run_dir / "comparator_clause.txt").write_text(
+            _NOEXEC_CLAUSE, encoding="utf-8")
+    elif condition == "baseline_cbmem2":
+        idx_cmd = _cbmem_index(inst, wt, run_dir)
+        (run_dir / "cbmem2_arm.txt").write_text(
+            "baseline_cbmem2: as-shipped Codebase-Memory install payload "
+            "(skill + 3 agents + SessionStart/SubagentStart/PreToolUse "
+            "Grep|Glob/PostToolUse Read hooks), server name "
+            "codebase-memory-mcp, baseline prompt with NO extra steer "
+            "sentence.\nindex cmd: %s\n" % " ".join(idx_cmd), encoding="utf-8")
+    elif condition == "baseline_csniper":
+        # their released Claude runner APPENDS the rendered code policy to the
+        # task prompt (CONTEXTSNIPER_APPEND_CODE_POLICY_TO_TASK=1 path)
+        policy = _csniper_policy()
+        comparator_prompt_override = agent.build_prompt(inst) + "\n\n" + policy
+        (run_dir / "csniper_policy.txt").write_text(policy, encoding="utf-8")
+
     is_flow_first = condition_flow_first(condition)
     is_nlplan = condition_nlplan(condition)
     is_flowonly = condition_flowonly(condition)
@@ -638,19 +742,53 @@ def run_cell(inst: dict, condition: str, results_dir: Path, args) -> dict:
                                                           tools3)
         flow3_sentinel = flow_protocol.SENTINEL
 
+    # CMV faithful arm (baseline_cmv2): the tool's hooks, with the
+    # PostToolUse trim routed through the stop-and-resume relay so the
+    # trimmed transcript reaches the model.
+    if condition == "baseline_cmv2":
+        gate_settings = agent.write_cmv2_settings(run_dir)
+
+    # related-work MCP configs are passed HERE (not via the shared mcp_config
+    # var) so is_tool_cell stays False and no --tools restriction is added --
+    # one thing changed vs the unrestricted baseline.
+    rw_mcp = None
+    if condition == "baseline_prunerB":
+        rw_mcp = agent.write_prunerB_mcp_config(run_dir)
+    elif condition == "baseline_csniper":
+        rw_mcp = agent.write_csniper_mcp_config(run_dir)
+    elif condition == "baseline_cbmem2":
+        rw_mcp = agent.write_cbmem2_mcp_config(run_dir)
+
     if args.agent == "claude":
         agent.run_agent(
             inst, run_dir, claude_bin=args.claude_bin, worktree=wt,
             model=args.model, effort=args.effort_flag,
             max_turns=args.max_turns,
             max_budget_usd=args.max_budget_usd,
-            timeout_sec=args.timeout_sec, mcp_config=mcp_config,
-            system_prompt_file=sys_prompt_file, restrict_tools=restrict,
+            timeout_sec=args.timeout_sec,
+            mcp_config=(rw_mcp if rw_mcp is not None else mcp_config),
+            system_prompt_file=(agent.PRUNERB_SYSTEM_PROMPT
+                                if condition == "baseline_prunerB"
+                                else sys_prompt_file),
+            restrict_tools=restrict,
             explore_tool=user_explore_tool, dyn_tool=user_dyn_tool,
             flow_tools=user_flow_tools, flow_first_tools=user_flow_first,
             nl_plan_tool=user_nl_plan, flow_only_tool=user_flow_only,
-            prompt_override=flow3_prompt, skill_md=flow3_skill_md,
-            sentinel=flow3_sentinel, gate_settings_file=gate_settings)
+            prompt_override=flow3_prompt or comparator_prompt_override,
+            skill_md=flow3_skill_md,
+            sentinel=flow3_sentinel, gate_settings_file=gate_settings,
+            plugin_dir=(agent.CSNIPER_PLUGIN
+                        if condition == "baseline_csniper" else None),
+            cbmem_dirs=(condition == "baseline_cbmem2"),
+            cbmem_payload=(condition == "baseline_cbmem2"),
+            claudemd_root_file=(_claudemd_for(iid)
+                                if condition == "baseline_agentsmd" else None),
+            # prunerB: bash-only like the paper's scaffold -- every read AND
+            # edit goes through the pruned wrappers (Edit needs a prior Read,
+            # which is disabled, so it is disabled too).
+            extra_disallowed=("Bash,Read,Grep,Glob,Edit,Write,MultiEdit,NotebookEdit"
+                              if condition == "baseline_prunerB" else None),
+            cmv_relay=(condition == "baseline_cmv2"))
     else:
         from experiments.common import codex_agent
         codex_prompt = flow3_prompt or agent.build_prompt(
@@ -833,6 +971,13 @@ def main(argv=None):
     if a.dataset == "verified":
         from experiments.swebench_verified import instances as _vinst
         instances = _vinst
+
+    for cond in a.conditions:
+        if (cond != "baseline" and cond not in RELATED_WORK_CONDITIONS
+                and cond != "codegraph" and condition_rep(cond) is None):
+            raise SystemExit("[swebench] unknown condition %r -- want baseline, "
+                             "<rep>_perrep_flow3, or one of %s"
+                             % (cond, sorted(RELATED_WORK_CONDITIONS)))
 
     ids = a.instance_ids
     if a.ids_file:

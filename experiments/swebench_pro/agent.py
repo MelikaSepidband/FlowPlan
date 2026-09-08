@@ -11,8 +11,10 @@ Reuses the linuxflbench claude-invocation conventions: ``claude -p`` with
 credentials, optional ``--mcp-config`` for a rep server, token-freshness guard.
 """
 
+import hashlib
 import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -72,6 +74,380 @@ def write_gate_settings(run_dir: Path, rep: str, explore_tool: str,
     p = run_dir / "settings.json"
     p.write_text(json.dumps(settings, indent=2), encoding="utf-8")
     return p
+
+
+# =============================================================================
+# Related-work arms (the published token-reduction methods we ran on Claude
+# Code against the flow arms; see related_works/README.md).
+#
+# Third-party code is NOT vendored. Clone it under third_party/ (or point the
+# FGT_* variables anywhere) -- pins are listed in related_works/README.md:
+#   third_party/ContextSniper     gitcode.com/lukchiwang/ContextSniper
+#   third_party/claude-code-cmv   github.com/CosmoNaught/claude-code-cmv (built)
+#   third_party/swe-pruner        github.com/Ayanami1314/swe-pruner (skimmer)
+#   codebase-memory-mcp           the tool's own installer binary
+# =============================================================================
+TOOLS_DIR = STUDY_ROOT / "tools"
+THIRD_PARTY = Path(os.environ.get("FGT_THIRD_PARTY", STUDY_ROOT / "third_party"))
+
+
+def _which(name: str, fallback: Path) -> Path:
+    found = shutil.which(name)
+    return Path(found) if found else fallback
+
+
+# -- ContextSniper (arXiv 2607.01916), condition baseline_csniper --------------
+CSNIPER_ROOT = Path(os.environ.get("FGT_CSNIPER_ROOT", THIRD_PARTY / "ContextSniper"))
+CSNIPER_PLUGIN = CSNIPER_ROOT / "claude-plugin"
+# -- Codebase-Memory MCP (arXiv 2603.27277), condition baseline_cbmem2 ---------
+CBMEM_BIN = Path(os.environ.get(
+    "FGT_CBMEM_BIN",
+    _which("codebase-memory-mcp", Path.home() / ".local" / "bin" / "codebase-memory-mcp")))
+# the tool AS `codebase-memory-mcp install` configures Claude Code: skill,
+# three graph agents, SessionStart/SubagentStart/PreToolUse(Grep|Glob)/
+# PostToolUse(Read) hooks -- captured verbatim from `install -y` into a
+# throwaway HOME (tools/cbmem_claude_payload/).
+CBMEM_PAYLOAD_DIR = TOOLS_DIR / "cbmem_claude_payload"
+# -- CLAUDE.md / AGENTS.md replication (arXiv 2601.20404), baseline_agentsmd ---
+CLAUDEMD_FULL_DIR = TOOLS_DIR / "claudemd_full"
+# -- SWE-Pruner (arXiv 2601.16746), condition baseline_prunerB -----------------
+# Route B = their pruning mechanism + their experiment template inside Claude
+# Code; every read goes through the pruned wrappers (native tools disabled).
+# The skimmer is served separately (their `swe-pruner --model-path ... --port
+# 8000`); FGT_PRUNER_URL points the wrappers at it.
+PRUNERB_SYSTEM_PROMPT = TOOLS_DIR / "prunerB_system.md"
+PRUNER_URL = os.environ.get("FGT_PRUNER_URL", "http://localhost:8000/prune")
+# -- CMV (arXiv 2602.22402), condition baseline_cmv2 ---------------------------
+CMV_ENTRY = Path(os.environ.get(
+    "FGT_CMV_ENTRY", THIRD_PARTY / "claude-code-cmv" / "dist" / "index.js"))
+NODE_BIN = Path(os.environ.get("FGT_NODE_BIN", _which("node", Path("/usr/bin/node"))))
+# The relay hook runs the tool's own `auto-trim --check-size` byte-identically
+# and, iff it trimmed, stops the session and leaves a marker; _cmv_relay_stages
+# then resumes the SAME session on the trimmed transcript (their own
+# `cmv trim --latest` workflow: exit, trim, relaunch with --resume).
+CMV_RELAY_HOOK = TOOLS_DIR / "cmv_relay_hook.sh"
+# Headless -p needs a prompt on every resumed leg (their interactive relaunch
+# needs none). Kept neutral and task-free -- disclosed.
+CMV_RESUME_PROMPT = "Continue the task from where you left off."
+CMV_MAX_LEGS = 12
+
+
+def _write_mcp(run_dir: Path, name: str, server: dict) -> Path:
+    p = run_dir / ("mcp_%s.json" % name)
+    p.write_text(json.dumps({"mcpServers": server}, indent=2), encoding="utf-8")
+    return p
+
+
+def write_prunerB_mcp_config(run_dir: Path) -> Path:
+    """--mcp-config for baseline_prunerB: the two pruned wrapper tools
+    (bash, cat) served by servers/pruner_server/server_b.py, calling the
+    skimmer over HTTP with the paper's threshold 0.5 / 500-char gate."""
+    (STUDY_ROOT / "results").mkdir(parents=True, exist_ok=True)
+    return _write_mcp(run_dir, "prunerB", {"pruned_tools": {
+        "command": str(VENV_PYTHON),
+        "args": ["-m", "servers.pruner_server.server_b"],
+        "env": {
+            "PYTHONPATH": str(STUDY_ROOT),
+            "PRUNER_URL": PRUNER_URL,
+            "PRUNER_THRESHOLD": "0.5",
+            "PRUNER_MIN_CHARS": "500",
+            "PRUNER_CHUNK_OVERLAP": "50",
+            "PRUNER_TIMEOUT": "120",
+            "PRUNER_RETRIES": "3",
+            "PRUNER_B_LOG": str(STUDY_ROOT / "results" / "prunerB_events.jsonl"),
+        }}})
+
+
+def write_csniper_mcp_config(run_dir: Path) -> Path:
+    """--mcp-config for baseline_csniper: the plugin's own MCP server binary,
+    registered explicitly (plugin-dir MCP loading fails silently on some CLI
+    builds; hooks/skills still ride in via --plugin-dir)."""
+    return _write_mcp(run_dir, "csniper", {"contextsniper": {
+        "command": str(CSNIPER_PLUGIN / "bin" / "contextsniper-mcp"),
+        "args": []}})
+
+
+def write_cbmem2_mcp_config(run_dir: Path) -> Path:
+    """--mcp-config for baseline_cbmem2: the binary under ITS OWN server name
+    (the shipped agents reference mcp__codebase-memory-mcp__* tools)."""
+    return _write_mcp(run_dir, "cbmem2", {"codebase-memory-mcp": {
+        "command": str(CBMEM_BIN), "args": []}})
+
+
+def _lay_cbmem_payload(run_dir: Path, home: Path) -> Path:
+    """Reproduce the Codebase-Memory `install` payload inside the per-cell
+    CLAUDE_CONFIG_DIR: skill (home/skills/codebase-memory/SKILL.md), the
+    three graph agents (home/agents/*.md), the three hook scripts
+    (home/hooks/*, BIN pointed at the real binary) and a settings file with
+    the shipped hook wiring. The shipped settings.json refers to
+    "$HOME/.claude/hooks/..."; HOME stays the real home under the harness, so
+    the commands are rewritten to absolute per-cell paths. Returns the
+    settings file path (passed via --settings)."""
+    src = CBMEM_PAYLOAD_DIR
+    for rel in ("skills/codebase-memory/SKILL.md",
+                "agents/codebase-memory.md",
+                "agents/codebase-memory-scout.md",
+                "agents/codebase-memory-auditor.md"):
+        dst = home / rel
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        dst.write_text((src / rel).read_text(encoding="utf-8"),
+                       encoding="utf-8")
+    hooks_dir = home / "hooks"
+    hooks_dir.mkdir(parents=True, exist_ok=True)
+    for name in ("cbm-code-discovery-gate", "cbm-session-reminder",
+                 "cbm-subagent-reminder"):
+        body = (src / "hooks" / name).read_text(encoding="utf-8")
+        body = re.sub(r"^BIN='.*'$", "BIN='%s'" % CBMEM_BIN, body, flags=re.M)
+        p = hooks_dir / name
+        p.write_text(body, encoding="utf-8")
+        p.chmod(0o755)
+    shipped = json.loads((src / "settings.json").read_text(encoding="utf-8"))
+
+    def _abs(cmd: str) -> str:
+        return '"%s"' % (hooks_dir / cmd.strip('"').rsplit("/", 1)[-1])
+    for _event, entries in shipped.get("hooks", {}).items():
+        for entry in entries:
+            for h in entry.get("hooks", []):
+                h["command"] = _abs(h["command"])
+    p = run_dir / "cbmem_settings.json"
+    p.write_text(json.dumps(shipped, indent=2), encoding="utf-8")
+    return p
+
+
+def write_cmv2_settings(run_dir: Path) -> Path:
+    """settings.json for baseline_cmv2: CMV's PreCompact hook exactly as
+    shipped (inert at our context sizes -- autocompact never fires) and its
+    PostToolUse hook routed through the relay wrapper, which calls their
+    `auto-trim --check-size` unchanged and adds the stop-and-resume step.
+    Absolute node + dist/index.js paths instead of the bare `cmv` the
+    installer writes -- their open issue #7: bare `cmv` is unresolvable in
+    the non-interactive shells Claude Code spawns for hooks."""
+    pre = "%s %s auto-trim" % (shlex.quote(str(NODE_BIN)),
+                              shlex.quote(str(CMV_ENTRY)))
+    post = "/bin/bash %s" % shlex.quote(str(CMV_RELAY_HOOK))
+    settings = {
+        "hooks": {
+            "PreCompact": [
+                {"matcher": "",
+                 "hooks": [{"type": "command", "command": pre,
+                            "timeout": 30}]}],
+            "PostToolUse": [
+                {"matcher": "",
+                 "hooks": [{"type": "command", "command": post,
+                            "timeout": 30}]}],
+        }
+    }
+    p = run_dir / "settings.json"
+    p.write_text(json.dumps(settings, indent=2), encoding="utf-8")
+    return p
+
+
+_NO_SUM_KEYS = {"contextWindow", "maxOutputTokens"}
+
+
+def _sum_numeric(a, b):
+    """Recursively add the numeric leaves of b into a (dicts merged by key;
+    capacity fields and non-numeric leaves keep b's value)."""
+    if isinstance(a, dict) and isinstance(b, dict):
+        out = dict(a)
+        for k, v in b.items():
+            if k in _NO_SUM_KEYS or k not in a:
+                out[k] = v
+            else:
+                out[k] = _sum_numeric(a[k], v)
+        return out
+    if (isinstance(a, (int, float)) and isinstance(b, (int, float))
+            and not isinstance(a, bool) and not isinstance(b, bool)):
+        return a + b
+    return b
+
+
+def _cmv_relay_stages(run_dir, cmd, env, wt, rc, max_turns, max_budget_usd,
+                      timeout_sec):
+    """baseline_cmv2: after each leg, if the relay hook trimmed the transcript
+    and halted the session (marker run_dir/cmv_relay_pending.json), resume
+    the SAME session -- Claude Code loads the now-trimmed JSONL -- with the
+    turn / $ budget that remains (never a raise). Legs are capped at
+    CMV_MAX_LEGS; a leg that ends on an agent-outcome error (max turns /
+    max budget) is final. Raw legs are kept as result_leg<n>.json and
+    result.json becomes the merged record (usage / modelUsage / cost / turns
+    / durations summed, outcome fields from the last leg), so every
+    downstream reader sees the whole cell. Returns (rc, timed_out)."""
+    def _parse(text):
+        try:
+            return json.loads(text or "{}")
+        except Exception:
+            return {}
+    r = _parse((run_dir / "result.json").read_text("utf-8"))
+    (run_dir / "result_leg1.json").write_text(json.dumps(r, indent=2), "utf-8")
+    legs = [{"leg": 1, "subtype": r.get("subtype"),
+             "num_turns": r.get("num_turns"), "rc": rc,
+             "cost": r.get("total_cost_usd")}]
+    merged = dict(r)
+    turns_used = int(r.get("num_turns") or 1)
+    cost_used = float(r.get("total_cost_usd") or 0.0)
+    marker_p = run_dir / "cmv_relay_pending.json"
+    leg, timed_out = 1, False
+    while marker_p.is_file() and leg < CMV_MAX_LEGS:
+        marker = _parse(marker_p.read_text("utf-8"))
+        marker_p.unlink()
+        sid = marker.get("session_id") or r.get("session_id")
+        sub = str(r.get("subtype") or "")
+        rem_turns = max_turns - turns_used
+        rem_budget = round(max_budget_usd - cost_used, 2)
+        if not sid or sub in ("error_max_turns", "error_max_budget_usd"):
+            legs.append({"leg": leg + 1, "skipped": "final leg (%s)"
+                         % (sub or "no session id")})
+            break
+        if rem_turns < 1 or rem_budget < 0.05:
+            legs.append({"leg": leg + 1, "skipped": "budget exhausted "
+                         "(turns_left=%d, usd_left=%.2f)"
+                         % (rem_turns, rem_budget)})
+            break
+        leg += 1
+        cmd2 = list(cmd)
+        cmd2[cmd2.index("-p") + 1] = CMV_RESUME_PROMPT
+        cmd2[cmd2.index("--max-turns") + 1] = str(rem_turns)
+        cmd2[cmd2.index("--max-budget-usd") + 1] = str(rem_budget)
+        cmd2 += ["--resume", sid]
+        try:
+            proc = subprocess.run(cmd2, cwd=str(wt), env=env,
+                                  capture_output=True, text=True,
+                                  timeout=timeout_sec, start_new_session=True)
+            out, rc = proc.stdout or "", proc.returncode
+            if proc.stderr:
+                (run_dir / ("stderr_leg%d.log" % leg)).write_text(
+                    proc.stderr, "utf-8")
+        except subprocess.TimeoutExpired as e:
+            out = (e.stdout if isinstance(e.stdout, str) else "") or ""
+            rc, timed_out = -1, True
+        (run_dir / ("result_leg%d.json" % leg)).write_text(out, "utf-8")
+        r = _parse(out)
+        legs.append({"leg": leg, "subtype": r.get("subtype"),
+                     "num_turns": r.get("num_turns"), "rc": rc,
+                     "cost": r.get("total_cost_usd"),
+                     "resumed_session": sid, "trim": marker,
+                     "max_turns": rem_turns, "max_budget_usd": rem_budget})
+        for k in ("usage", "modelUsage", "total_cost_usd", "num_turns",
+                  "duration_ms", "duration_api_ms"):
+            if k in merged and k in r:
+                merged[k] = _sum_numeric(merged[k], r[k])
+            elif k in r:
+                merged[k] = r[k]
+        for k in ("subtype", "is_error", "stop_reason", "result",
+                  "session_id", "terminal_reason", "permission_denials"):
+            if k in r:
+                merged[k] = r[k]
+        turns_used += int(r.get("num_turns") or 1)
+        cost_used += float(r.get("total_cost_usd") or 0.0)
+        if timed_out:
+            break
+    trims = []
+    try:
+        for line in (run_dir / "cmv_trims.jsonl").read_text("utf-8").splitlines():
+            if line.strip():
+                trims.append(_parse(line))
+    except OSError:
+        pass
+    merged["cmv_relay"] = {
+        "legs": legs, "trims": trims, "n_legs": leg,
+        "turns_used": turns_used, "cost_used": round(cost_used, 4),
+        "max_turns": max_turns, "max_budget_usd": max_budget_usd,
+        "resume_prompt": CMV_RESUME_PROMPT,
+        "size_threshold_env": os.environ.get("CMV_SIZE_THRESHOLD")}
+    (run_dir / "result.json").write_text(json.dumps(merged, indent=2), "utf-8")
+    return rc, timed_out
+
+
+def csniper_env(run_dir: Path, worktree: Optional[Path]) -> dict:
+    """Per-cell environment for the ContextSniper plugin: their venv python
+    + built AGFS backend, per-cell storage/runtime inside run_dir, the FILTER
+    condition of their released Claude runner (filters + filtering prompt
+    ON; the code policy is appended to the task prompt by run_experiment),
+    their SWE-Pro runner's retrieval knobs, ripgrep on PATH, and their
+    in-tree sentence-transformers embedder (default model BAAI/bge-m3, CPU,
+    offline weights). Semantic FUSION in search_code stays OFF (their
+    release default). Thread / batch caps only bound memory; they change
+    speed, never retrieval output."""
+    e = {
+        "PY_BIN": str(CSNIPER_ROOT / ".venv" / "bin" / "python"),
+        "AGFS_BIN": str(CSNIPER_ROOT / "agfs" / "build" / "agfs-server"),
+        "CONTEXTSNIPER_DIR": str(CSNIPER_ROOT),
+        "CONTEXTSNIPER_LOCAL_STORAGE_DIR": str(run_dir / "csniper_store"),
+        "CONTEXTSNIPER_RETRIEVAL_SEMANTIC_ENABLED": "0",
+        "CONTEXTSNIPER_PLUGIN_AUTO_START": "1",
+        "CONTEXTSNIPER_PLUGIN_AUTO_STOP": "1",
+        "CONTEXTSNIPER_FILTER_ENABLED": "1",
+        "CONTEXTSNIPER_FILTER_NATIVE_READ": "1",
+        "CONTEXTSNIPER_FILTER_NATIVE_BASH": "1",
+        "CONTEXTSNIPER_INJECT_FILTERING_PROMPT": "1",
+        "CONTEXTSNIPER_INJECT_CODE_POLICY_ON_SUBMIT": "0",
+        "CONTEXTSNIPER_DISABLE_AFTER_TURN_EXTRACTION": "1",
+        "CONTEXTSNIPER_CODE_TOGGLE": "true",
+        "VECTOR_DB_TYPE": "memory",
+        "CONTEXTSNIPER_SESSION_ID": run_dir.name,
+        "CONTEXTSNIPER_PLUGIN_START_WAIT": "60",
+        "MCP_TIMEOUT": "120000",
+        "EMBEDDING_PROVIDER": "st",
+        "ST_MODEL": "BAAI/bge-m3",
+        "HF_HUB_OFFLINE": "1",
+        "TRANSFORMERS_OFFLINE": "1",
+        "TOKENIZERS_PARALLELISM": "false",
+        "OMP_NUM_THREADS": "2",
+        "MKL_NUM_THREADS": "2",
+        "OPENBLAS_NUM_THREADS": "2",
+        "TORCH_NUM_THREADS": "2",
+        "CONTEXTSNIPER_CODE_SEARCH_EMBED_BATCH_TEXTS": "16",
+        "CONTEXTSNIPER_CODE_SEARCH_EMBED_BATCH_TOKENS": "8000",
+        "CONTEXTSNIPER_RUNTIME_DIR": str(run_dir / "csniper_runtime"),
+        "CONTEXTSNIPER_STORAGE_BACKEND": "agfs",
+        "CONTEXTSNIPER_CODE_TOGGLE_FORCE": "true",
+        "CONTEXTSNIPER_RETRIEVAL_GRAPH_ENABLED": "1",
+        "CONTEXTSNIPER_RETRIEVAL_SYMBOLIC_ENABLED": "1",
+        "CONTEXTSNIPER_RETRIEVAL_FREQUENCY_ENABLED": "1",
+        "CONTEXTSNIPER_CODE_SEARCH_CANDIDATE_MAX_FILES": "40",
+        "CONTEXTSNIPER_CODE_SEARCH_EMBED_MAX_FILES": "20",
+        "CONTEXTSNIPER_CODE_SEARCH_MAX_SNIPPETS": "250",
+        "CONTEXTSNIPER_CODE_SEARCH_INGEST_CANDIDATES": "1",
+        "CONTEXTSNIPER_CODE_SEARCH_INGEST_ASYNC": "1",
+        "CONTEXTSNIPER_CODE_SEARCH_INGEST_MAX_FILES": "3",
+        "CONTEXTSNIPER_CODE_SEARCH_INGEST_MAX_CHUNKS": "40",
+        "CONTEXTSNIPER_CODE_SEARCH_INGEST_WORKERS": "2",
+        "CONTEXTSNIPER_CODE_FUSE_MODE": "weighted_rrf",
+        "CONTEXTSNIPER_CODE_FUSE_W_EMBED": "0.33",
+        "CONTEXTSNIPER_CODE_FUSE_W_BM25": "0.17",
+        "CONTEXTSNIPER_CODE_FUSE_W_CTAGS": "0.17",
+        "CONTEXTSNIPER_CODE_FUSE_W_GRAPH": "0.33",
+        "CONTEXTSNIPER_BOOTSTRAP_MAX_FILES": "40",
+        "CONTEXTSNIPER_BOOTSTRAP_FULL_INDEX_CAP_FILES": "40",
+        "CONTEXTSNIPER_SWE_COPY_AGFS_RUNTIME": "1",
+        "CONTEXTSNIPER_ACCOUNT_ID": "acct-demo-r0",
+        "CONTEXTSNIPER_USER_ID": "u-claude-r0",
+        "CONTEXTSNIPER_AGENT_ID": "claude-code-r0",
+        "NO_PROXY": "127.0.0.1,localhost,::1",
+        "no_proxy": "127.0.0.1,localhost,::1",
+    }
+    if worktree is not None:
+        e["CONTEXTSNIPER_WORKSPACE_ROOT"] = str(worktree)
+    return e
+
+
+def cbmem_env(run_dir: Path, worktree: Optional[Path]) -> dict:
+    """Per-cell Codebase-Memory env (full isolation; the MCP server and the
+    hooks inherit it and find the pre-built index). The runtime dir holds a
+    unix socket (sun_path ~108-char limit) so it must be SHORT; keyed by a
+    run_dir hash. The shipped hooks enforce a 2000 ms in-process deadline
+    and exit silently past it; CBM_HOOK_DEADLINE_MS is the tool's own knob."""
+    e = {
+        "CBM_CACHE_DIR": str(run_dir / "cbm_cache"),
+        "CBM_RUNTIME_DIR": "/tmp/cbmrt_%s" % hashlib.md5(
+            str(run_dir).encode()).hexdigest()[:10],
+        "CBM_LOG_LEVEL": "error",
+        "CBM_HOOK_DEADLINE_MS": "4500",
+    }
+    if worktree is not None:
+        e["CBM_ALLOWED_ROOT"] = str(worktree)
+    return e
 
 
 def build_prompt(inst: dict[str, Any], explore_tool: Optional[str] = None,
@@ -611,12 +987,17 @@ def build_command(claude_bin: str, prompt: str, model: str, effort: str,
                   max_turns: int, max_budget_usd: float,
                   mcp_config: Optional[Path], system_prompt_file: Optional[Path],
                   restrict_tools: bool = False,
-                  settings_file: Optional[Path] = None) -> list[str]:
+                  settings_file: Optional[Path] = None,
+                  plugin_dir: Optional[Path] = None,
+                  extra_disallowed: Optional[str] = None) -> list[str]:
     """claude argv: -p, json output, EDIT-capable (bypassPermissions).
 
     restrict_tools=True caps the built-in toolset to ESSENTIAL_BUILTIN_TOOLS so
     MCP tools stay active (non-deferred) for rep/codegraph cells.
     settings_file (when set) supplies the explore-gate PreToolUse hook.
+    plugin_dir (ContextSniper arm) loads the tool's own Claude Code plugin.
+    extra_disallowed (SWE-Pruner Route B) disables native tools so every read
+    and edit goes through the pruned wrappers.
     """
     cmd = [claude_bin, "-p", prompt, "--output-format", "json",
            "--strict-mcp-config"]
@@ -628,13 +1009,17 @@ def build_command(claude_bin: str, prompt: str, model: str, effort: str,
     cmd += ["--permission-mode", "bypassPermissions",
             "--max-turns", str(max_turns),
             "--max-budget-usd", str(max_budget_usd),
-            "--disallowedTools", "WebFetch,WebSearch"]
+            "--disallowedTools",
+            "WebFetch,WebSearch" + ("," + extra_disallowed
+                                    if extra_disallowed else "")]
     if restrict_tools:
         cmd += ["--tools", ESSENTIAL_BUILTIN_TOOLS]
     if system_prompt_file is not None:
         cmd += ["--append-system-prompt-file", str(system_prompt_file)]
     if settings_file is not None:
         cmd += ["--settings", str(settings_file)]
+    if plugin_dir is not None:
+        cmd += ["--plugin-dir", str(plugin_dir)]
     return cmd
 
 
@@ -655,7 +1040,13 @@ def run_agent(inst: dict[str, Any], run_dir: Path, *, claude_bin: str,
               prompt_override: Optional[str] = None,
               gate_settings_file: Optional[Path] = None,
               skill_md: Optional[str] = None,
-              sentinel: Optional[str] = None) -> dict[str, Any]:
+              sentinel: Optional[str] = None,
+              plugin_dir: Optional[Path] = None,
+              cbmem_dirs: bool = False,
+              cbmem_payload: bool = False,
+              claudemd_root_file: Optional[Path] = None,
+              extra_disallowed: Optional[str] = None,
+              cmv_relay: bool = False) -> dict[str, Any]:
     """Run the agent in ``worktree`` (already prepared + maps built), extract the
     patch. If ``worktree`` is None, prepare a fresh one (standalone use).
 
@@ -682,6 +1073,13 @@ def run_agent(inst: dict[str, Any], run_dir: Path, *, claude_bin: str,
         # NEVER the worktree (a worktree file would leak into patch.diff).
         from experiments.common import flow_protocol
         flow_protocol.write_skill(home, skill_md)
+    if cbmem_payload:
+        # baseline_cbmem2: the tool's own Claude Code install payload (skill,
+        # agents, hooks) in the per-cell claude-home; hook wiring via
+        # --settings.
+        cbm_settings = _lay_cbmem_payload(run_dir, home)
+        if gate_settings_file is None:
+            gate_settings_file = cbm_settings
     started_at = __import__("time").time()
     env = dict(os.environ)
     env["CLAUDE_CONFIG_DIR"] = str(home)
@@ -716,6 +1114,30 @@ def run_agent(inst: dict[str, Any], run_dir: Path, *, claude_bin: str,
     userbase.mkdir(parents=True, exist_ok=True)
     env["PYTHONUSERBASE"] = str(userbase)
     env["PIP_USER"] = "0"
+    # -- related-work arms ---------------------------------------------------
+    if cbmem_dirs:
+        env.update(cbmem_env(run_dir, worktree))
+    if plugin_dir:
+        # ContextSniper: ripgrep must be on PATH for their candidate collector
+        # (`rg -l -F`); ~/.local/bin is where a static rg usually lives.
+        env["PATH"] = str(Path.home() / ".local" / "bin") + os.pathsep + env.get("PATH", "")
+        env.update(csniper_env(run_dir, worktree))
+    if cmv_relay:
+        # the relay hook resolves node + the CMV entry from these
+        env["CMV_NODE_BIN"] = str(NODE_BIN)
+        env["CMV_ENTRY"] = str(CMV_ENTRY)
+    # AGENTS.md replication arm (arXiv 2601.20404, baseline_agentsmd): the
+    # per-repo file sits at the REPOSITORY ROOT as project memory, exactly
+    # where the study's organic AGENTS.md sat. It is removed again before
+    # patch extraction (see below) so it can never enter patch.diff.
+    laid_root_claudemd = False
+    if claudemd_root_file is not None:
+        root_md = wt / "CLAUDE.md"
+        if not root_md.exists():
+            root_md.write_text(
+                Path(claudemd_root_file).read_text(encoding="utf-8"),
+                encoding="utf-8")
+            laid_root_claudemd = True
     if extra_env:
         env.update(extra_env)
 
@@ -728,10 +1150,32 @@ def run_agent(inst: dict[str, Any], run_dir: Path, *, claude_bin: str,
     if env.get("REPR_TEST_SHIM") == "1":
         test_shim_info = setup_test_shim(run_dir, env)
 
+    if cbmem_payload:
+        # Warm per-cell CBM daemon (the tool's documented steady state: the
+        # shipped hooks only produce context while one is running; in a cold
+        # `-p` session the SessionStart hook fires BEFORE the MCP server
+        # starts the daemon). Own UI port per cell so concurrent daemons do
+        # not collide; stopped after the agent. Logged to cbmem_daemon.log.
+        try:
+            port = 20000 + int(hashlib.md5(str(run_dir).encode()).hexdigest()[:4],
+                               16) % 20000
+            d = subprocess.run([str(CBMEM_BIN), "daemon", "start",
+                                "--port=%d" % port],
+                               env=env, capture_output=True, text=True,
+                               timeout=120)
+            (run_dir / "cbmem_daemon.log").write_text(
+                "start rc=%s\n%s\n%s\n" % (d.returncode, d.stdout, d.stderr),
+                encoding="utf-8")
+        except Exception as e:  # fail-open like the hooks themselves
+            (run_dir / "cbmem_daemon.log").write_text(
+                "start FAILED: %r\n" % (e,), encoding="utf-8")
+
     cmd = build_command(claude_bin, prompt, model, effort, max_turns,
                         max_budget_usd, mcp_config, system_prompt_file,
                         restrict_tools=restrict_tools,
-                        settings_file=gate_settings_file)
+                        settings_file=gate_settings_file,
+                        plugin_dir=plugin_dir,
+                        extra_disallowed=extra_disallowed)
     meta = {"instance_id": inst["instance_id"], "repo": inst["repo"],
             "base_commit": inst["base_commit"], "worktree": str(wt),
             "model": model, "effort": effort}
@@ -758,9 +1202,27 @@ def run_agent(inst: dict[str, Any], run_dir: Path, *, claude_bin: str,
             e.stdout, str) else "", "utf-8")
         rc = -1
 
+    if cmv_relay and not timed_out:
+        # baseline_cmv2: stop-and-resume relay on every CMV trim, so the
+        # trimmed transcript is what the model actually sees.
+        rc, timed_out = _cmv_relay_stages(run_dir, cmd, env, wt, rc,
+                                          max_turns, max_budget_usd,
+                                          timeout_sec)
+
     # harvest the session transcript (for MCP/tool-usage telemetry) from the
     # per-run claude-home before extracting the patch.
     _harvest_transcript(home, run_dir, started_at)
+
+    if cbmem_payload:
+        try:
+            d = subprocess.run([str(CBMEM_BIN), "daemon", "stop"], env=env,
+                               capture_output=True, text=True, timeout=120)
+            with open(run_dir / "cbmem_daemon.log", "a", encoding="utf-8") as fh:
+                fh.write("stop rc=%s\n%s\n%s\n" % (d.returncode, d.stdout,
+                                                   d.stderr))
+        except Exception as e:
+            with open(run_dir / "cbmem_daemon.log", "a", encoding="utf-8") as fh:
+                fh.write("stop FAILED: %r\n" % (e,))
 
     if sentinel:
         # flow3 skill telemetry: did /flowfix actually expand? Recorded in
@@ -769,6 +1231,16 @@ def run_agent(inst: dict[str, Any], run_dir: Path, *, claude_bin: str,
         meta["skill_expanded"] = flow_protocol.skill_expanded(
             run_dir / "transcript.jsonl", sentinel)
         (run_dir / "meta.json").write_text(json.dumps(meta, indent=2), "utf-8")
+
+    if laid_root_claudemd:
+        # take the repo-root CLAUDE.md back out (and out of the index, in
+        # case the agent staged it) before the diff is extracted.
+        try:
+            (wt / "CLAUDE.md").unlink()
+        except OSError:
+            pass
+        subprocess.run(["git", "rm", "-q", "--cached", "--ignore-unmatch",
+                        "--", "CLAUDE.md"], cwd=str(wt), capture_output=True)
 
     # extract the agent's patch (worktree diff vs base, test files excluded)
     patch = checkout.diff_excluding_tests(inst, wt)

@@ -148,6 +148,14 @@ Long batches outlive the CLI's OAuth token. The runners check remaining token
 lifetime before each cell and **skip without writing artifacts** when it is
 about to expire — re-login (`claude`) and re-run the same command to resume.
 
+## Related-work arms
+
+Six published token-reduction methods were run on plain Claude Code on the
+same 30-instance subset, each as one condition of the same runner:
+`baseline_noexec`, `baseline_prunerB`, `baseline_csniper`, `baseline_cbmem2`,
+`baseline_agentsmd`, `baseline_cmv2`. What each one is, the third-party
+pins, and the launch lines are in [related_works/README.md](related_works/README.md).
+
 ## Tests
 
 ```bash
@@ -178,5 +186,7 @@ indexer/                    # symbols.db builder (function-name resolution)
 perrep/                     # engine support imported by the server
 samples/                    # benchmark instance data
 data/ids/                   # canonical instance subsets
+tools/, servers/pruner_server/   assets for the related-work arms (see related_works/README.md)
+related_works/              # the six published comparators run on Claude Code: docs + as-run scripts
 tests/
 ```

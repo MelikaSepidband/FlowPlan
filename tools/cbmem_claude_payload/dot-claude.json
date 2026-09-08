@@ -1,0 +1,5 @@
+{
+  "mcpServers": {
+    "codebase-memory-mcp": {"command":"/tmp/cbm_probe_home/.local/bin/codebase-memory-mcp","args":[]}
+  }
+}
