@@ -294,12 +294,17 @@ def diff_excluding_tests(inst: dict[str, Any], wt: Path) -> str:
         base = "HEAD"  # isolated single-snapshot repo
     # stage everything (so new files appear in the diff) EXCEPT the tool dirs,
     # then diff against base.
+    # .cmind / .claude / .mcp.json: the CoderMind arm's own workspace files
+    # (baseline_codermind), laid by `cmind init` -- tool artifacts, not the
+    # agent's work; no other arm creates them.
     _run(["git", "add", "-A", "--",
-          ":(exclude).perrep", ":(exclude).repr_index", ":(exclude).codegraph"],
+          ":(exclude).perrep", ":(exclude).repr_index", ":(exclude).codegraph",
+          ":(exclude).cmind", ":(exclude).claude", ":(exclude).mcp.json"],
          cwd=wt, check=False)
     res = _run(["git", "diff", "--cached", base, "--",
                 ":(exclude).perrep", ":(exclude).repr_index",
-                ":(exclude).codegraph"], cwd=wt, check=False)
+                ":(exclude).codegraph", ":(exclude).cmind", ":(exclude).claude",
+                ":(exclude).mcp.json"], cwd=wt, check=False)
     full = res.stdout
     # Strip BOTH the tests selected for grading AND every gold-test path the
     # benchmark lays down (test_patch + before_repo_set_cmd checkouts). The

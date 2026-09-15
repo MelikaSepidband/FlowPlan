@@ -11,10 +11,9 @@ Reuses the linuxflbench claude-invocation conventions: ``claude -p`` with
 credentials, optional ``--mcp-config`` for a rep server, token-freshness guard.
 """
 
-import hashlib
 import json
-import os
 import re
+import os
 import shlex
 import shutil
 import subprocess
@@ -26,6 +25,20 @@ from experiments.swebench_pro import checkout
 STUDY_ROOT = Path(__file__).resolve().parents[2]
 VENV_PYTHON = STUDY_ROOT / ".venv" / "bin" / "python"
 GATE_HOOK = STUDY_ROOT / "experiments" / "swebench_pro" / "explore_gate_hook.py"
+GRAPHFIRST_HOOK = (STUDY_ROOT / "experiments" / "swebench_pro"
+                   / "graphfirst_gate_hook.py")
+WITNESS_STOP_HOOK = (STUDY_ROOT / "experiments" / "swebench_pro"
+                     / "witness_stop_hook.py")
+
+# "More with Less" turn-control comparator arms (arXiv 2510.16786, ICSE'26):
+# the paper's per-tool-result reminder (hook) and its one-time extension
+# prompt (dynamic-turn strategy), both verbatim from the paper.
+TURN_REMINDER_HOOK = (STUDY_ROOT / "experiments" / "swebench_pro"
+                      / "turn_reminder_hook.py")
+TURN_EXTENSION_PROMPT = ("You have used up all turns but have not yet "
+                         "completed the task. You are granted an additional "
+                         "%d turns to continue and complete the task.")
+EET_HOOK = STUDY_ROOT / "experiments" / "swebench_pro" / "eet_hook.py"
 
 
 def _hook_cmd(env_pairs: dict, hook_path: Path) -> str:
@@ -35,39 +48,16 @@ def _hook_cmd(env_pairs: dict, hook_path: Path) -> str:
     return "%s %s %s" % (prefix, shlex.quote(str(VENV_PYTHON)), shlex.quote(str(hook_path)))
 
 
-def write_gate_settings(run_dir: Path, rep: str, explore_tool: str,
-                        worktree: Optional[Path] = None) -> Path:
-    """settings.json wiring the MAP-SURFACED explore-gate (PreToolUse + PostToolUse,
-    same hook script). Holds the closed-gate token economics (-21%) WITHOUT the
-    empty patches.
-
-    Design (revised 2026-06-22, final, after the gate-never-opened and
-    edit-scoped misfires):
-    - PostToolUse on the rep MCP tools: record the repo-relative file paths the
-      map result surfaced, into RUN_DIR/.surfaced_files.
-    - PreToolUse: DENY Read/Grep/Glob used to BROWSE (agent localizes via the
-      MAP -> Read low / MCP high / -21%), but ALLOW a Read of a file the map has
-      already SURFACED (so the agent can open the file it localized and edit it;
-      this also satisfies Claude Code's Edit read-first rule -> no empty patch).
-      Edit/Write are allowed and also pre-add their target to the allowlist.
-
-    Net: Read rises only to ~the files the map pointed at (~2-3), not ~12 of
-    browsing; the read-to-edit never dead-ends -> no empty patches. Bash is NOT
-    matched (the cat/sed block backfired -- see memory swebench-bash-not-waste).
-    The `worktree` arg is accepted for signature compatibility but unused now."""
-    mcp_pat = "mcp__%s_perrep__.*" % rep
-    pre_matcher = "Read|Grep|Glob|Edit|Write|MultiEdit|NotebookEdit|%s" % mcp_pat
-    cmd = _hook_cmd(
-        {"RUN_DIR": str(run_dir), "REPR_GATE_REP": rep,
-         "REPR_GATE_TOOL": explore_tool}, GATE_HOOK)
+def write_graphfirst_gate_settings(run_dir: Path) -> Path:
+    """settings.json for the graphfirst arm's read gate: PreToolUse on
+    Read|Grep|Glob only, denying until RUN_DIR/flow_plan.json exists (the
+    flow_plan tool's own artifact = the unlock; cannot fail to open when
+    the protocol is followed). Bash/Edit/Write/MCP are never matched."""
+    cmd = _hook_cmd({"RUN_DIR": str(run_dir)}, GRAPHFIRST_HOOK)
     settings = {
         "hooks": {
             "PreToolUse": [
-                {"matcher": pre_matcher,
-                 "hooks": [{"type": "command", "command": cmd}]}],
-            # PostToolUse only needs the MCP tools (to record surfaced paths).
-            "PostToolUse": [
-                {"matcher": mcp_pat,
+                {"matcher": "Read|Grep|Glob",
                  "hooks": [{"type": "command", "command": cmd}]}],
         }
     }
@@ -76,102 +66,52 @@ def write_gate_settings(run_dir: Path, rep: str, explore_tool: str,
     return p
 
 
-# =============================================================================
-# Related-work arms (the published token-reduction methods we ran on Claude
-# Code against the flow arms; see related_works/README.md).
-#
-# Third-party code is NOT vendored. Clone it under third_party/ (or point the
-# FGT_* variables anywhere) -- pins are listed in related_works/README.md:
-#   third_party/ContextSniper     gitcode.com/lukchiwang/ContextSniper
-#   third_party/claude-code-cmv   github.com/CosmoNaught/claude-code-cmv (built)
-#   third_party/swe-pruner        github.com/Ayanami1314/swe-pruner (skimmer)
-#   codebase-memory-mcp           the tool's own installer binary
-# =============================================================================
-TOOLS_DIR = STUDY_ROOT / "tools"
-THIRD_PARTY = Path(os.environ.get("FGT_THIRD_PARTY", STUDY_ROOT / "third_party"))
+RTK_BIN = STUDY_ROOT / "tools" / "rtk" / "rtk"
 
 
-def _which(name: str, fallback: Path) -> Path:
-    found = shutil.which(name)
-    return Path(found) if found else fallback
+def write_rtk_settings(run_dir: Path) -> Path:
+    """settings.json for the RTK comparator arm ("Token Reduction Is Not
+    Cost Reduction", arXiv 2607.12161): the tool's OWN PreToolUse hook,
+    matcher "Bash", command `<rtk> hook claude` -- byte-identical in effect
+    to what `rtk init -g` installs, written directly per cell (exactly how
+    the paper's own harness scoped it: install once, rewrite the command to
+    the pinned binary, pass via --settings).
 
-
-# -- ContextSniper (arXiv 2607.01916), condition baseline_csniper --------------
-CSNIPER_ROOT = Path(os.environ.get("FGT_CSNIPER_ROOT", THIRD_PARTY / "ContextSniper"))
-CSNIPER_PLUGIN = CSNIPER_ROOT / "claude-plugin"
-# -- Codebase-Memory MCP (arXiv 2603.27277), condition baseline_cbmem2 ---------
-CBMEM_BIN = Path(os.environ.get(
-    "FGT_CBMEM_BIN",
-    _which("codebase-memory-mcp", Path.home() / ".local" / "bin" / "codebase-memory-mcp")))
-# the tool AS `codebase-memory-mcp install` configures Claude Code: skill,
-# three graph agents, SessionStart/SubagentStart/PreToolUse(Grep|Glob)/
-# PostToolUse(Read) hooks -- captured verbatim from `install -y` into a
-# throwaway HOME (tools/cbmem_claude_payload/).
-CBMEM_PAYLOAD_DIR = TOOLS_DIR / "cbmem_claude_payload"
-# -- CLAUDE.md / AGENTS.md replication (arXiv 2601.20404), baseline_agentsmd ---
-CLAUDEMD_FULL_DIR = TOOLS_DIR / "claudemd_full"
-# -- SWE-Pruner (arXiv 2601.16746), condition baseline_prunerB -----------------
-# Route B = their pruning mechanism + their experiment template inside Claude
-# Code; every read goes through the pruned wrappers (native tools disabled).
-# The skimmer is served separately (their `swe-pruner --model-path ... --port
-# 8000`); FGT_PRUNER_URL points the wrappers at it.
-PRUNERB_SYSTEM_PROMPT = TOOLS_DIR / "prunerB_system.md"
-PRUNER_URL = os.environ.get("FGT_PRUNER_URL", "http://localhost:8000/prune")
-# -- CMV (arXiv 2602.22402), condition baseline_cmv2 ---------------------------
-CMV_ENTRY = Path(os.environ.get(
-    "FGT_CMV_ENTRY", THIRD_PARTY / "claude-code-cmv" / "dist" / "index.js"))
-NODE_BIN = Path(os.environ.get("FGT_NODE_BIN", _which("node", Path("/usr/bin/node"))))
-# The relay hook runs the tool's own `auto-trim --check-size` byte-identically
-# and, iff it trimmed, stops the session and leaves a marker; _cmv_relay_stages
-# then resumes the SAME session on the trimmed transcript (their own
-# `cmv trim --latest` workflow: exit, trim, relaunch with --resume).
-CMV_RELAY_HOOK = TOOLS_DIR / "cmv_relay_hook.sh"
-# Headless -p needs a prompt on every resumed leg (their interactive relaunch
-# needs none). Kept neutral and task-free -- disclosed.
-CMV_RESUME_PROMPT = "Continue the task from where you left off."
-CMV_MAX_LEGS = 12
-
-
-def _write_mcp(run_dir: Path, name: str, server: dict) -> Path:
-    p = run_dir / ("mcp_%s.json" % name)
-    p.write_text(json.dumps({"mcpServers": server}, indent=2), encoding="utf-8")
+    HOOK-ONLY, matching the paper's arm: no RTK.md / @RTK.md prompt text, so
+    the only thing that changes vs baseline is the Bash-rewrite hook. The
+    rewritten commands start with `rtk `, so the binary's directory is put
+    on PATH for the agent process by run_agent."""
+    cmd = "%s hook claude" % shlex.quote(str(RTK_BIN))
+    settings = {
+        "hooks": {
+            "PreToolUse": [
+                {"matcher": "Bash",
+                 "hooks": [{"type": "command", "command": cmd,
+                            "timeout": 30}]}],
+        }
+    }
+    p = run_dir / "settings.json"
+    p.write_text(json.dumps(settings, indent=2), encoding="utf-8")
     return p
 
 
-def write_prunerB_mcp_config(run_dir: Path) -> Path:
-    """--mcp-config for baseline_prunerB: the two pruned wrapper tools
-    (bash, cat) served by servers/pruner_server/server_b.py, calling the
-    skimmer over HTTP with the paper's threshold 0.5 / 500-char gate."""
-    (STUDY_ROOT / "results").mkdir(parents=True, exist_ok=True)
-    return _write_mcp(run_dir, "prunerB", {"pruned_tools": {
-        "command": str(VENV_PYTHON),
-        "args": ["-m", "servers.pruner_server.server_b"],
-        "env": {
-            "PYTHONPATH": str(STUDY_ROOT),
-            "PRUNER_URL": PRUNER_URL,
-            "PRUNER_THRESHOLD": "0.5",
-            "PRUNER_MIN_CHARS": "500",
-            "PRUNER_CHUNK_OVERLAP": "50",
-            "PRUNER_TIMEOUT": "120",
-            "PRUNER_RETRIES": "3",
-            "PRUNER_B_LOG": str(STUDY_ROOT / "results" / "prunerB_events.jsonl"),
-        }}})
-
-
-def write_csniper_mcp_config(run_dir: Path) -> Path:
-    """--mcp-config for baseline_csniper: the plugin's own MCP server binary,
-    registered explicitly (plugin-dir MCP loading fails silently on some CLI
-    builds; hooks/skills still ride in via --plugin-dir)."""
-    return _write_mcp(run_dir, "csniper", {"contextsniper": {
-        "command": str(CSNIPER_PLUGIN / "bin" / "contextsniper-mcp"),
-        "args": []}})
-
-
-def write_cbmem2_mcp_config(run_dir: Path) -> Path:
-    """--mcp-config for baseline_cbmem2: the binary under ITS OWN server name
-    (the shipped agents reference mcp__codebase-memory-mcp__* tools)."""
-    return _write_mcp(run_dir, "cbmem2", {"codebase-memory-mcp": {
-        "command": str(CBMEM_BIN), "args": []}})
+CSNIPER_ROOT = STUDY_ROOT / "tools" / "ContextSniper"
+CSNIPER_PLUGIN = CSNIPER_ROOT / "claude-plugin"
+# The plugin's MCP server must ride in via --mcp-config: --plugin-dir MCP
+# loading fails SILENTLY on CLI 2.1.236 (verified 2026-09-01; hooks/skills
+# from --plugin-dir do load). Same server binary, explicit registration.
+CSNIPER_MCP_CONFIG = STUDY_ROOT / "tools" / "csniper_mcp.json"
+# Codebase-Memory MCP comparator arm (arXiv 2603.27277, v0.10.8 binary).
+CBMEM_BIN = Path.home() / ".local" / "bin" / "codebase-memory-mcp"
+CBMEM_MCP_CONFIG = STUDY_ROOT / "tools" / "cbmem_mcp.json"
+# baseline_cbmem2 (2026-09-03 fidelity rerun): the tool AS `codebase-memory-mcp
+# install` configures Claude Code -- server registered under its own name
+# (the shipped agents reference mcp__codebase-memory-mcp__* tools), plus the
+# shipped skill, three graph agents, and the SessionStart / SubagentStart /
+# PreToolUse(Grep|Glob) / PostToolUse(Read) hooks. Payload captured verbatim
+# from `install -y` into a throwaway HOME (tools/cbmem_claude_payload/).
+CBMEM2_MCP_CONFIG = STUDY_ROOT / "tools" / "cbmem2_mcp.json"
+CBMEM_PAYLOAD_DIR = STUDY_ROOT / "tools" / "cbmem_claude_payload"
 
 
 def _lay_cbmem_payload(run_dir: Path, home: Path) -> Path:
@@ -184,6 +124,7 @@ def _lay_cbmem_payload(run_dir: Path, home: Path) -> Path:
     the commands are rewritten to absolute per-cell paths. Returns the
     settings file path (passed via --settings)."""
     src = CBMEM_PAYLOAD_DIR
+    # skill + agents: verbatim copies
     for rel in ("skills/codebase-memory/SKILL.md",
                 "agents/codebase-memory.md",
                 "agents/codebase-memory-scout.md",
@@ -192,36 +133,96 @@ def _lay_cbmem_payload(run_dir: Path, home: Path) -> Path:
         dst.parent.mkdir(parents=True, exist_ok=True)
         dst.write_text((src / rel).read_text(encoding="utf-8"),
                        encoding="utf-8")
+    # hook scripts: same bodies, BIN= the real binary path
     hooks_dir = home / "hooks"
     hooks_dir.mkdir(parents=True, exist_ok=True)
     for name in ("cbm-code-discovery-gate", "cbm-session-reminder",
                  "cbm-subagent-reminder"):
         body = (src / "hooks" / name).read_text(encoding="utf-8")
-        body = re.sub(r"^BIN='.*'$", "BIN='%s'" % CBMEM_BIN, body, flags=re.M)
+        body = re.sub(r"^BIN='.*'$", "BIN='%s'" % CBMEM_BIN, body,
+                      flags=re.M)
         p = hooks_dir / name
         p.write_text(body, encoding="utf-8")
         p.chmod(0o755)
+    # settings: the shipped structure with absolute hook paths
     shipped = json.loads((src / "settings.json").read_text(encoding="utf-8"))
-
     def _abs(cmd: str) -> str:
         return '"%s"' % (hooks_dir / cmd.strip('"').rsplit("/", 1)[-1])
-    for _event, entries in shipped.get("hooks", {}).items():
+    for event, entries in shipped.get("hooks", {}).items():
         for entry in entries:
             for h in entry.get("hooks", []):
                 h["command"] = _abs(h["command"])
     p = run_dir / "cbmem_settings.json"
     p.write_text(json.dumps(shipped, indent=2), encoding="utf-8")
     return p
+# CLAUDE.md comparator arm (AGENTS.md study analogue, arXiv 2601.20404):
+# per-repo generated files; delivered via claude-home/CLAUDE.md (user
+# memory) so the worktree -- and therefore patch.diff -- is never touched.
+CLAUDEMD_DIR = STUDY_ROOT / "tools" / "claudemd"
+# SWE-Pruner comparator arm (arXiv 2601.16746): ported wrapper MCP server.
+PRUNER_MCP_CONFIG = STUDY_ROOT / "tools" / "mcp_pruner.json"
+# Route B (baseline_prunerB): the paper's pruning mechanism + their
+# experiment template inside Claude Code; every read goes through the
+# pruned wrappers (native Bash/Read/Grep/Glob disabled).
+PRUNERB_MCP_CONFIG = STUDY_ROOT / "tools" / "mcp_prunerB.json"
+PRUNERB_SYSTEM_PROMPT = STUDY_ROOT / "tools" / "prunerB_system.md"
+CMV_ENTRY = (STUDY_ROOT / "tools" / "claude-code-cmv" / "dist" / "index.js")
+NODE_BIN = Path.home() / ".nvm" / "versions" / "node" / "v24.15.0" / "bin" / "node"
+
+
+def write_cmv_settings(run_dir: Path) -> Path:
+    """settings.json for the CMV comparator arm (arXiv 2602.22402,
+    claude-code-cmv): the tool's OWN PreCompact + PostToolUse hooks, the
+    same two entries `cmv hook install` writes, scoped per cell.
+
+    ABSOLUTE paths (node + dist/index.js) instead of the bare `cmv` the
+    installer writes -- their open issue #7: bare `cmv` is unresolvable in
+    the non-interactive shells Claude Code spawns for hooks, which silently
+    disables the arm."""
+    base = "%s %s auto-trim" % (shlex.quote(str(NODE_BIN)),
+                               shlex.quote(str(CMV_ENTRY)))
+    settings = {
+        "hooks": {
+            "PreCompact": [
+                {"matcher": "",
+                 "hooks": [{"type": "command", "command": base,
+                            "timeout": 30}]}],
+            "PostToolUse": [
+                {"matcher": "",
+                 "hooks": [{"type": "command",
+                            "command": base + " --check-size",
+                            "timeout": 10}]}],
+        }
+    }
+    p = run_dir / "settings.json"
+    p.write_text(json.dumps(settings, indent=2), encoding="utf-8")
+    return p
+
+
+# baseline_cmv2 -- the FAITHFUL CMV arm (audit 2026-09-03). swe30_cmv ran the
+# tool's hooks as shipped, and they did rewrite 9/30 transcripts on disk
+# (295 stubs), but a live Claude Code process never re-reads its JSONL: the
+# post-trim API calls carried 88-136K context and not one call showed a
+# cache-read-zero rewrite, i.e. the trim never reached the model and the row
+# measured nothing. CMV's trim is designed to take effect on the NEXT
+# `claude --resume` (their `cmv trim --latest` = snapshot, trim, relaunch).
+# The relay hook (tools/cmv_relay_hook.sh) runs their `auto-trim --check-size`
+# byte-identically and, iff it trimmed, stops the session (`continue: false`)
+# and leaves a marker; _cmv_relay_stages then resumes the SAME session on the
+# trimmed transcript with the remaining turn/$ budget.
+CMV_RELAY_HOOK = STUDY_ROOT / "tools" / "cmv_relay_hook.sh"
+# Headless -p needs a prompt on every resumed leg (their interactive relaunch
+# needs none; their Branch prepends a user-written orientation message).
+# Kept neutral and task-free -- disclosed in the fidelity ledger.
+CMV_RESUME_PROMPT = "Continue the task from where you left off."
+CMV_MAX_LEGS = 12
 
 
 def write_cmv2_settings(run_dir: Path) -> Path:
     """settings.json for baseline_cmv2: CMV's PreCompact hook exactly as
     shipped (inert at our context sizes -- autocompact never fires) and its
     PostToolUse hook routed through the relay wrapper, which calls their
-    `auto-trim --check-size` unchanged and adds the stop-and-resume step.
-    Absolute node + dist/index.js paths instead of the bare `cmv` the
-    installer writes -- their open issue #7: bare `cmv` is unresolvable in
-    the non-interactive shells Claude Code spawns for hooks."""
+    `auto-trim --check-size` unchanged and adds the stop-and-resume step."""
     pre = "%s %s auto-trim" % (shlex.quote(str(NODE_BIN)),
                               shlex.quote(str(CMV_ENTRY)))
     post = "/bin/bash %s" % shlex.quote(str(CMV_RELAY_HOOK))
@@ -240,26 +241,6 @@ def write_cmv2_settings(run_dir: Path) -> Path:
     p = run_dir / "settings.json"
     p.write_text(json.dumps(settings, indent=2), encoding="utf-8")
     return p
-
-
-_NO_SUM_KEYS = {"contextWindow", "maxOutputTokens"}
-
-
-def _sum_numeric(a, b):
-    """Recursively add the numeric leaves of b into a (dicts merged by key;
-    capacity fields and non-numeric leaves keep b's value)."""
-    if isinstance(a, dict) and isinstance(b, dict):
-        out = dict(a)
-        for k, v in b.items():
-            if k in _NO_SUM_KEYS or k not in a:
-                out[k] = v
-            else:
-                out[k] = _sum_numeric(a[k], v)
-        return out
-    if (isinstance(a, (int, float)) and isinstance(b, (int, float))
-            and not isinstance(a, bool) and not isinstance(b, bool)):
-        return a + b
-    return b
 
 
 def _cmv_relay_stages(run_dir, cmd, env, wt, rc, max_turns, max_budget_usd,
@@ -359,95 +340,130 @@ def _cmv_relay_stages(run_dir, cmd, env, wt, rc, max_turns, max_budget_usd,
     return rc, timed_out
 
 
-def csniper_env(run_dir: Path, worktree: Optional[Path]) -> dict:
-    """Per-cell environment for the ContextSniper plugin: their venv python
-    + built AGFS backend, per-cell storage/runtime inside run_dir, the FILTER
-    condition of their released Claude runner (filters + filtering prompt
-    ON; the code policy is appended to the task prompt by run_experiment),
-    their SWE-Pro runner's retrieval knobs, ripgrep on PATH, and their
-    in-tree sentence-transformers embedder (default model BAAI/bge-m3, CPU,
-    offline weights). Semantic FUSION in search_code stays OFF (their
-    release default). Thread / batch caps only bound memory; they change
-    speed, never retrieval output."""
-    e = {
-        "PY_BIN": str(CSNIPER_ROOT / ".venv" / "bin" / "python"),
-        "AGFS_BIN": str(CSNIPER_ROOT / "agfs" / "build" / "agfs-server"),
-        "CONTEXTSNIPER_DIR": str(CSNIPER_ROOT),
-        "CONTEXTSNIPER_LOCAL_STORAGE_DIR": str(run_dir / "csniper_store"),
-        "CONTEXTSNIPER_RETRIEVAL_SEMANTIC_ENABLED": "0",
-        "CONTEXTSNIPER_PLUGIN_AUTO_START": "1",
-        "CONTEXTSNIPER_PLUGIN_AUTO_STOP": "1",
-        "CONTEXTSNIPER_FILTER_ENABLED": "1",
-        "CONTEXTSNIPER_FILTER_NATIVE_READ": "1",
-        "CONTEXTSNIPER_FILTER_NATIVE_BASH": "1",
-        "CONTEXTSNIPER_INJECT_FILTERING_PROMPT": "1",
-        "CONTEXTSNIPER_INJECT_CODE_POLICY_ON_SUBMIT": "0",
-        "CONTEXTSNIPER_DISABLE_AFTER_TURN_EXTRACTION": "1",
-        "CONTEXTSNIPER_CODE_TOGGLE": "true",
-        "VECTOR_DB_TYPE": "memory",
-        "CONTEXTSNIPER_SESSION_ID": run_dir.name,
-        "CONTEXTSNIPER_PLUGIN_START_WAIT": "60",
-        "MCP_TIMEOUT": "120000",
-        "EMBEDDING_PROVIDER": "st",
-        "ST_MODEL": "BAAI/bge-m3",
-        "HF_HUB_OFFLINE": "1",
-        "TRANSFORMERS_OFFLINE": "1",
-        "TOKENIZERS_PARALLELISM": "false",
-        "OMP_NUM_THREADS": "2",
-        "MKL_NUM_THREADS": "2",
-        "OPENBLAS_NUM_THREADS": "2",
-        "TORCH_NUM_THREADS": "2",
-        "CONTEXTSNIPER_CODE_SEARCH_EMBED_BATCH_TEXTS": "16",
-        "CONTEXTSNIPER_CODE_SEARCH_EMBED_BATCH_TOKENS": "8000",
-        "CONTEXTSNIPER_RUNTIME_DIR": str(run_dir / "csniper_runtime"),
-        "CONTEXTSNIPER_STORAGE_BACKEND": "agfs",
-        "CONTEXTSNIPER_CODE_TOGGLE_FORCE": "true",
-        "CONTEXTSNIPER_RETRIEVAL_GRAPH_ENABLED": "1",
-        "CONTEXTSNIPER_RETRIEVAL_SYMBOLIC_ENABLED": "1",
-        "CONTEXTSNIPER_RETRIEVAL_FREQUENCY_ENABLED": "1",
-        "CONTEXTSNIPER_CODE_SEARCH_CANDIDATE_MAX_FILES": "40",
-        "CONTEXTSNIPER_CODE_SEARCH_EMBED_MAX_FILES": "20",
-        "CONTEXTSNIPER_CODE_SEARCH_MAX_SNIPPETS": "250",
-        "CONTEXTSNIPER_CODE_SEARCH_INGEST_CANDIDATES": "1",
-        "CONTEXTSNIPER_CODE_SEARCH_INGEST_ASYNC": "1",
-        "CONTEXTSNIPER_CODE_SEARCH_INGEST_MAX_FILES": "3",
-        "CONTEXTSNIPER_CODE_SEARCH_INGEST_MAX_CHUNKS": "40",
-        "CONTEXTSNIPER_CODE_SEARCH_INGEST_WORKERS": "2",
-        "CONTEXTSNIPER_CODE_FUSE_MODE": "weighted_rrf",
-        "CONTEXTSNIPER_CODE_FUSE_W_EMBED": "0.33",
-        "CONTEXTSNIPER_CODE_FUSE_W_BM25": "0.17",
-        "CONTEXTSNIPER_CODE_FUSE_W_CTAGS": "0.17",
-        "CONTEXTSNIPER_CODE_FUSE_W_GRAPH": "0.33",
-        "CONTEXTSNIPER_BOOTSTRAP_MAX_FILES": "40",
-        "CONTEXTSNIPER_BOOTSTRAP_FULL_INDEX_CAP_FILES": "40",
-        "CONTEXTSNIPER_SWE_COPY_AGFS_RUNTIME": "1",
-        "CONTEXTSNIPER_ACCOUNT_ID": "acct-demo-r0",
-        "CONTEXTSNIPER_USER_ID": "u-claude-r0",
-        "CONTEXTSNIPER_AGENT_ID": "claude-code-r0",
-        "NO_PROXY": "127.0.0.1,localhost,::1",
-        "no_proxy": "127.0.0.1,localhost,::1",
+def write_squeez_settings(run_dir: Path) -> Path:
+    """settings.json for the Squeez enforced arm (arXiv 2604.04979):
+    PreToolUse Bash hook rewriting commands to pipe long output through the
+    authors' squeez CLI (enforced version of their advisory CLAUDE.md
+    integration; RTK-style updatedInput mechanism)."""
+    settings = {
+        "hooks": {
+            "PreToolUse": [
+                {"matcher": "Bash",
+                 "hooks": [{"type": "command",
+                            "command": "/usr/bin/python3 %s" % shlex.quote(
+                                str(STUDY_ROOT / "tools" / "squeez_hook.py")),
+                            "timeout": 30}]}],
+        }
     }
-    if worktree is not None:
-        e["CONTEXTSNIPER_WORKSPACE_ROOT"] = str(worktree)
-    return e
+    p = run_dir / "settings.json"
+    p.write_text(json.dumps(settings, indent=2), encoding="utf-8")
+    return p
 
 
-def cbmem_env(run_dir: Path, worktree: Optional[Path]) -> dict:
-    """Per-cell Codebase-Memory env (full isolation; the MCP server and the
-    hooks inherit it and find the pre-built index). The runtime dir holds a
-    unix socket (sun_path ~108-char limit) so it must be SHORT; keyed by a
-    run_dir hash. The shipped hooks enforce a 2000 ms in-process deadline
-    and exit silently past it; CBM_HOOK_DEADLINE_MS is the tool's own knob."""
-    e = {
-        "CBM_CACHE_DIR": str(run_dir / "cbm_cache"),
-        "CBM_RUNTIME_DIR": "/tmp/cbmrt_%s" % hashlib.md5(
-            str(run_dir).encode()).hexdigest()[:10],
-        "CBM_LOG_LEVEL": "error",
-        "CBM_HOOK_DEADLINE_MS": "4500",
+def write_witness_stop_settings(run_dir: Path,
+                                max_turns: Optional[int] = None) -> Path:
+    """settings.json for the witness arm's Stop hook: the agent cannot
+    FINISH until a flow_witness call returned FLIP (or BROKEN_ENV, or the
+    tool budget is spent). Q6 guards live in the hook: block ONCE, only
+    with turn headroom (MAX_TURNS passed here), allow on any read error.
+    The unlock artifact is RUN_DIR/witness_calls.json, written by the
+    flow_witness tool itself (same principle as the graph-first gate: the
+    protocol's own artifact is the key, so the hook cannot fail to open
+    when the protocol is followed). Fails open on any internal error."""
+    env_pairs = {"RUN_DIR": str(run_dir)}
+    if max_turns:
+        env_pairs["MAX_TURNS"] = str(int(max_turns))
+    cmd = _hook_cmd(env_pairs, WITNESS_STOP_HOOK)
+    settings = {
+        "hooks": {
+            "Stop": [
+                {"hooks": [{"type": "command", "command": cmd,
+                            "timeout": 30}]}],
+        }
     }
-    if worktree is not None:
-        e["CBM_ALLOWED_ROOT"] = str(worktree)
-    return e
+    p = run_dir / "settings.json"
+    p.write_text(json.dumps(settings, indent=2), encoding="utf-8")
+    return p
+
+
+def write_turn_reminder_settings(run_dir: Path, cap: int) -> Path:
+    """settings.json for the "More with Less" turn-control arms: a
+    PostToolUse hook on EVERY tool that returns the paper's reminder
+    ("ENVIRONMENT REMINDER: You have X turns left to complete the task.")
+    as additionalContext, X = cap - assistant turns so far. Rewritten with
+    the extended cap when the dynamic arm grants its buffer."""
+    cmd = _hook_cmd({"RUN_DIR": str(run_dir), "TURN_CAP": str(int(cap))},
+                    TURN_REMINDER_HOOK)
+    settings = {
+        "hooks": {
+            "PostToolUse": [
+                {"hooks": [{"type": "command", "command": cmd,
+                            "timeout": 30}]}],
+        }
+    }
+    p = run_dir / "settings.json"
+    p.write_text(json.dumps(settings, indent=2), encoding="utf-8")
+    return p
+
+
+def write_eet_settings(run_dir: Path) -> Path:
+    """settings.json for EET lever B (ACL'26 Findings, arXiv 2601.05777): a
+    PostToolUse hook reproducing their ExperienceRetrievalAgent key-step
+    detection, <confidence_check> request and >=81 <submission_prompt>.
+    Only written for cells where their retrieval fired -- their own coupling
+    (no experience -> plain DefaultAgent, no confidence checks)."""
+    cmd = _hook_cmd({"EET_RUN_DIR": str(run_dir), "EET_ENABLED": "1"}, EET_HOOK)
+    settings = {
+        "hooks": {
+            "PostToolUse": [
+                {"hooks": [{"type": "command", "command": cmd,
+                            "timeout": 30}]}],
+        }
+    }
+    p = run_dir / "settings.json"
+    p.write_text(json.dumps(settings, indent=2), encoding="utf-8")
+    return p
+
+
+def write_gate_settings(run_dir: Path, rep: str, explore_tool: str,
+                        worktree: Optional[Path] = None) -> Path:
+    """settings.json wiring the MAP-SURFACED explore-gate (PreToolUse + PostToolUse,
+    same hook script). Holds the closed-gate token economics (-21%) WITHOUT the
+    empty patches.
+
+    Design (revised 2026-06-22, final, after the gate-never-opened and
+    edit-scoped misfires):
+    - PostToolUse on the rep MCP tools: record the repo-relative file paths the
+      map result surfaced, into RUN_DIR/.surfaced_files.
+    - PreToolUse: DENY Read/Grep/Glob used to BROWSE (agent localizes via the
+      MAP -> Read low / MCP high / -21%), but ALLOW a Read of a file the map has
+      already SURFACED (so the agent can open the file it localized and edit it;
+      this also satisfies Claude Code's Edit read-first rule -> no empty patch).
+      Edit/Write are allowed and also pre-add their target to the allowlist.
+
+    Net: Read rises only to ~the files the map pointed at (~2-3), not ~12 of
+    browsing; the read-to-edit never dead-ends -> no empty patches. Bash is NOT
+    matched (the cat/sed block backfired -- see memory swebench-bash-not-waste).
+    The `worktree` arg is accepted for signature compatibility but unused now."""
+    mcp_pat = "mcp__%s_perrep__.*" % rep
+    pre_matcher = "Read|Grep|Glob|Edit|Write|MultiEdit|NotebookEdit|%s" % mcp_pat
+    cmd = _hook_cmd(
+        {"RUN_DIR": str(run_dir), "REPR_GATE_REP": rep,
+         "REPR_GATE_TOOL": explore_tool}, GATE_HOOK)
+    settings = {
+        "hooks": {
+            "PreToolUse": [
+                {"matcher": pre_matcher,
+                 "hooks": [{"type": "command", "command": cmd}]}],
+            # PostToolUse only needs the MCP tools (to record surfaced paths).
+            "PostToolUse": [
+                {"matcher": mcp_pat,
+                 "hooks": [{"type": "command", "command": cmd}]}],
+        }
+    }
+    p = run_dir / "settings.json"
+    p.write_text(json.dumps(settings, indent=2), encoding="utf-8")
+    return p
 
 
 def build_prompt(inst: dict[str, Any], explore_tool: Optional[str] = None,
@@ -687,20 +703,36 @@ def build_prompt(inst: dict[str, Any], explore_tool: Optional[str] = None,
         # planning and NO verification -- just "see the flow, find the spot,
         # edit". Isolates whether the flow VIEW alone helps, separate from any
         # plan/verify discipline (flow_of vs nlplan vs cfg_perrep_flow ladder).
+        # src variant (2026-08-24 ablation): identical two-step text worded
+        # for the SOURCE view; cfg/dfg wording stays byte-identical.
+        srcv = "src_perrep" in flow_only_tool
         parts += [
-            "## Work IN THE FLOW (there is no code map)",
-            "You fix this bug by working in the function's flow, not by reading "
-            "the whole repo. Do NOT rewrite the whole function -- find the ONE "
-            "part of the flow that, if changed, makes the failing behavior go "
-            "away, and change only that.",
-            "1. (REQUIRED FIRST) Call `%s` with the function/symbol names the "
-            "bug report mentions. It returns each function's real flow graph. "
-            "There is no explore/map tool; this flow is your surface."
-            % flow_only_tool,
-            "2. Read the flow to find where the fix goes, then make the SMALL "
-            "code edit there (open the file with Read to get the exact lines, "
-            "then Edit). Do not restructure code the flow didn't point you to. "
-            "End with a non-empty patch.",
+            ("## Work FROM THE SOURCE (there is no code map)" if srcv
+             else "## Work IN THE FLOW (there is no code map)"),
+            ("You fix this bug by working from the function's source, not by "
+             "reading the whole repo. Do NOT rewrite the whole function -- "
+             "find the ONE spot that, if changed, makes the failing behavior "
+             "go away, and change only that." if srcv else
+             "You fix this bug by working in the function's flow, not by reading "
+             "the whole repo. Do NOT rewrite the whole function -- find the ONE "
+             "part of the flow that, if changed, makes the failing behavior go "
+             "away, and change only that."),
+            ("1. (REQUIRED FIRST) Call `%s` with the function/symbol names "
+             "the bug report mentions. It returns each function's source "
+             "with real file line numbers. There is no explore/map tool; "
+             "this source is your surface." % flow_only_tool if srcv else
+             "1. (REQUIRED FIRST) Call `%s` with the function/symbol names the "
+             "bug report mentions. It returns each function's real flow graph. "
+             "There is no explore/map tool; this flow is your surface."
+             % flow_only_tool),
+            ("2. Read the source to find where the fix goes, then make the "
+             "SMALL code edit there (open the file with Read to get the "
+             "exact lines, then Edit). Do not restructure code the source "
+             "didn't point you to. End with a non-empty patch." if srcv else
+             "2. Read the flow to find where the fix goes, then make the SMALL "
+             "code edit there (open the file with Read to get the exact lines, "
+             "then Edit). Do not restructure code the flow didn't point you to. "
+             "End with a non-empty patch."),
             "",
         ]
     if explore_tool:
@@ -927,10 +959,21 @@ def _venv_pytest_ok(venv_python: str, info: dict) -> bool:
         return False
 
 
-def setup_test_shim(run_dir: Path, env: dict) -> dict:
+def setup_test_shim(run_dir: Path, env: dict, repo: Optional[Path] = None,
+                    cache_key: Optional[str] = None,
+                    image: Optional[str] = None,
+                    instance_id: Optional[str] = None) -> dict:
     """Build ``run_dir/testshim`` (``python`` + ``pytest`` exec shims) plus a
     per-cell venv (``run_dir/testenv``, --system-site-packages) and PREPEND
     both to ``env["PATH"]`` (mutated in place).
+
+    ``repo`` + ``REPR_TEST_SHIM_LADDER=1`` in ``env``: run the interpreter
+    compatibility ladder (experiments.common.testenv_ladder) -- when the
+    host 3.12 venv cannot import the checkout (old ansible commits die at
+    collection under 3.12), rebuild ``testenv`` on uv-managed 3.11/3.10/3.9
+    and keep the interpreter with the fewest collection errors; decision
+    cached per ``cache_key`` (repo@base_commit) so every arm on the same
+    instance gets the same interpreter. Recorded under ``info["ladder"]``.
 
     The venv is the robust interpreter choice: the agent gets a real python it
     (and our pytest bootstrap) can pip install into without touching the
@@ -958,6 +1001,28 @@ def setup_test_shim(run_dir: Path, env: dict) -> dict:
         info["venv_error"] = repr(e)
     if info["venv_ok"]:
         info["pytest_ok"] = _venv_pytest_ok(str(venv_python), info)
+    if info["venv_ok"] and repo is not None:
+        from experiments.common import testenv_ladder
+        if testenv_ladder.enabled(env):
+            # the instance's own test environment (official harness
+            # Dockerfile ENV + run_script exports, /app -> worktree):
+            # used by the ladder's probes and, via test_env.json, by the
+            # witness tool's test runs -- NOT by the agent's shell (parity)
+            harness = (testenv_ladder.harness_env(instance_id, Path(repo))
+                       if instance_id else None)
+            if harness:
+                try:
+                    (run_dir / "test_env.json").write_text(
+                        json.dumps(harness, indent=1), encoding="utf-8")
+                except OSError:
+                    pass
+            info["ladder"] = testenv_ladder.apply_ladder(
+                run_dir, Path(repo), cache_key=cache_key, image=image,
+                base_env=env, harness=harness)
+            if info["ladder"].get("chosen", "system") != "system":
+                # the winner now sits at run_dir/testenv (same path the
+                # shims and the witness tool resolve); re-verify pytest
+                info["pytest_ok"] = _venv_pytest_ok(str(venv_python), info)
 
     shim_dir = run_dir / "testshim"
     shim_dir.mkdir(parents=True, exist_ok=True)
@@ -988,16 +1053,17 @@ def build_command(claude_bin: str, prompt: str, model: str, effort: str,
                   mcp_config: Optional[Path], system_prompt_file: Optional[Path],
                   restrict_tools: bool = False,
                   settings_file: Optional[Path] = None,
+                  tools_override: Optional[str] = None,
                   plugin_dir: Optional[Path] = None,
                   extra_disallowed: Optional[str] = None) -> list[str]:
     """claude argv: -p, json output, EDIT-capable (bypassPermissions).
 
     restrict_tools=True caps the built-in toolset to ESSENTIAL_BUILTIN_TOOLS so
     MCP tools stay active (non-deferred) for rep/codegraph cells.
+    tools_override (flow3r stage 1) supplies a CUSTOM --tools list instead --
+    e.g. a read-only set with no Edit/Write for the plan-only relay stage;
+    it takes precedence over restrict_tools.
     settings_file (when set) supplies the explore-gate PreToolUse hook.
-    plugin_dir (ContextSniper arm) loads the tool's own Claude Code plugin.
-    extra_disallowed (SWE-Pruner Route B) disables native tools so every read
-    and edit goes through the pruned wrappers.
     """
     cmd = [claude_bin, "-p", prompt, "--output-format", "json",
            "--strict-mcp-config"]
@@ -1012,15 +1078,269 @@ def build_command(claude_bin: str, prompt: str, model: str, effort: str,
             "--disallowedTools",
             "WebFetch,WebSearch" + ("," + extra_disallowed
                                     if extra_disallowed else "")]
-    if restrict_tools:
+    if tools_override is not None:
+        cmd += ["--tools", tools_override]
+    elif restrict_tools:
         cmd += ["--tools", ESSENTIAL_BUILTIN_TOOLS]
     if system_prompt_file is not None:
         cmd += ["--append-system-prompt-file", str(system_prompt_file)]
     if settings_file is not None:
         cmd += ["--settings", str(settings_file)]
     if plugin_dir is not None:
+        # ContextSniper arm: load the tool's own Claude Code plugin (MCP
+        # server + hooks + skills), exactly as its contextsniper-claude
+        # launcher does.
         cmd += ["--plugin-dir", str(plugin_dir)]
     return cmd
+
+
+_NO_SUM_KEYS = {"contextWindow", "maxOutputTokens"}
+
+
+def _sum_numeric(a, b):
+    """Recursively add the numeric leaves of b into a (dicts merged by key;
+    capacity fields and non-numeric leaves keep b's value)."""
+    if isinstance(a, dict) and isinstance(b, dict):
+        out = dict(a)
+        for k, v in b.items():
+            if k in _NO_SUM_KEYS or k not in a:
+                out[k] = v
+            else:
+                out[k] = _sum_numeric(a[k], v)
+        return out
+    if (isinstance(a, (int, float)) and isinstance(b, (int, float))
+            and not isinstance(a, bool) and not isinstance(b, bool)):
+        return a + b
+    return b
+
+
+def _turn_extension_stage(run_dir, cmd, env, wt, inst, rc, cap, extension,
+                          timeout_sec):
+    """Dynamic-turn strategy of "More with Less" (arXiv 2510.16786): when
+    the initial turn limit is exhausted before the task is complete
+    (stage 1 ended in error_max_turns), grant ONE buffer of `extension`
+    turns by resuming the same session with the paper's extension prompt.
+    Keeps both raw records (result_stage1.json, result_ext.json) and makes
+    result.json the merged record (usage / cost / turns summed) so every
+    downstream reader sees the whole cell. No-op otherwise."""
+    try:
+        r1 = json.loads((run_dir / "result.json").read_text("utf-8") or "{}")
+    except Exception:
+        return rc
+    if r1.get("subtype") != "error_max_turns" or not r1.get("session_id"):
+        return rc
+    stage1_patch = len(checkout.diff_excluding_tests(inst, wt).strip())
+    (run_dir / "result_stage1.json").write_text(json.dumps(r1, indent=2),
+                                                "utf-8")
+    # the reminder hook now counts down from the extended cap
+    write_turn_reminder_settings(run_dir, cap + extension)
+    cmd2 = list(cmd)
+    cmd2[cmd2.index("-p") + 1] = TURN_EXTENSION_PROMPT % extension
+    cmd2[cmd2.index("--max-turns") + 1] = str(extension)
+    cmd2 += ["--resume", r1["session_id"]]
+    try:
+        proc = subprocess.run(cmd2, cwd=str(wt), env=env, capture_output=True,
+                              text=True, timeout=timeout_sec,
+                              start_new_session=True)
+        out, rc2 = proc.stdout or "", proc.returncode
+        if proc.stderr:
+            (run_dir / "stderr_ext.log").write_text(proc.stderr, "utf-8")
+    except subprocess.TimeoutExpired as e:
+        out = (e.stdout if isinstance(e.stdout, str) else "") or ""
+        rc2 = -1
+    (run_dir / "result_ext.json").write_text(out, "utf-8")
+    try:
+        r2 = json.loads(out or "{}")
+    except Exception:
+        r2 = {}
+    merged = dict(r2) if r2 else dict(r1)
+    for k in ("usage", "modelUsage", "total_cost_usd", "num_turns",
+              "duration_ms", "duration_api_ms"):
+        if k in r1 and k in r2:
+            merged[k] = _sum_numeric(r1[k], r2[k])
+        elif k in r1:
+            merged[k] = r1[k]
+    merged["turn_extension"] = {
+        "initial_cap": cap, "extension": extension,
+        "stage1_subtype": r1.get("subtype"), "stage1_turns": r1.get("num_turns"),
+        "stage1_patch_bytes": stage1_patch,
+        "stage2_subtype": r2.get("subtype"), "stage2_turns": r2.get("num_turns"),
+        "stage2_rc": rc2}
+    (run_dir / "result.json").write_text(json.dumps(merged, indent=2), "utf-8")
+    return rc2
+
+
+AGENTDIET_PROXY = STUDY_ROOT / "tools" / "agentdiet_proxy.py"
+LINGUA_VENV_PYTHON = STUDY_ROOT / "tools" / "lingua_venv" / "bin" / "python"
+
+
+def _start_agentdiet_proxy(run_dir: Path, claude_bin: str, model: str,
+                           effort: str) -> tuple:
+    """baseline_agentdiet: one AgentDiet proxy per cell (tools/agentdiet_proxy.py,
+    same interpreter as the other proxies). Returns (proc, base_url). The
+    reflection calls it makes are headless Claude Code sessions with their
+    own seeded claude-home under run_dir (never through the proxy)."""
+    import hashlib as _hl
+    import urllib.request as _ur
+    port = 8900 + int(_hl.md5(str(run_dir).encode()).hexdigest()[:4], 16) % 1000
+    home = run_dir / "agentdiet-home"
+    home.mkdir(parents=True, exist_ok=True)
+    src = Path.home() / ".claude"
+    for name, dst in ((".credentials.json", ".credentials.json"),
+                      ("settings.json", "settings.json")):
+        if (src / name).is_file():
+            shutil.copy2(src / name, home / dst)
+    if (Path.home() / ".claude.json").is_file():
+        shutil.copy2(Path.home() / ".claude.json", home / ".claude.json")
+    penv = dict(os.environ)
+    penv.pop("ANTHROPIC_BASE_URL", None)
+    penv.update({"AGENTDIET_PORT": str(port), "RUN_DIR": str(run_dir),
+                 "AGENTDIET_CLAUDE_BIN": str(claude_bin),
+                 "AGENTDIET_MODEL": model, "AGENTDIET_EFFORT": effort or "",
+                 "AGENTDIET_HOME": str(home)})
+    log = open(run_dir / "agentdiet_proxy.log", "a", encoding="utf-8")
+    proc = subprocess.Popen([str(LINGUA_VENV_PYTHON), str(AGENTDIET_PROXY)],
+                            env=penv, stdout=log, stderr=subprocess.STDOUT,
+                            start_new_session=True)
+    base = "http://127.0.0.1:%d" % port
+    for _ in range(60):
+        try:
+            if _ur.urlopen(base + "/agentdiet-health", timeout=2).read() == b"ok":
+                return proc, base
+        except Exception:
+            pass
+        if proc.poll() is not None:
+            break
+        __import__("time").sleep(0.5)
+    raise RuntimeError("agentdiet proxy did not come up (see agentdiet_proxy.log)")
+
+
+SEEREPO_ELIDE_PROXY = STUDY_ROOT / "tools" / "seerepo_elide_proxy.py"
+
+
+def _start_seerepo_proxy(run_dir: Path) -> tuple:
+    """baseline_seerepo: one image-elision proxy per cell
+    (tools/seerepo_elide_proxy.py -- their _elide_old_image_messages rule).
+    Returns (proc, base_url)."""
+    import hashlib as _hl
+    import urllib.request as _ur
+    port = 9900 + int(_hl.md5(str(run_dir).encode()).hexdigest()[:4], 16) % 1000
+    penv = dict(os.environ)
+    penv.pop("ANTHROPIC_BASE_URL", None)
+    penv.update({"SEEREPO_ELIDE_PORT": str(port), "RUN_DIR": str(run_dir)})
+    log = open(run_dir / "seerepo_proxy.log", "a", encoding="utf-8")
+    proc = subprocess.Popen([str(LINGUA_VENV_PYTHON), str(SEEREPO_ELIDE_PROXY)],
+                            env=penv, stdout=log, stderr=subprocess.STDOUT,
+                            start_new_session=True)
+    base = "http://127.0.0.1:%d" % port
+    for _ in range(60):
+        try:
+            if _ur.urlopen(base + "/seerepo-health", timeout=2).read() == b"ok":
+                return proc, base
+        except Exception:
+            pass
+        if proc.poll() is not None:
+            break
+        __import__("time").sleep(0.5)
+    raise RuntimeError("seerepo elide proxy did not come up (see seerepo_proxy.log)")
+
+
+def _stop_agentdiet_proxy(proc, base: str) -> None:
+    import urllib.request as _ur
+    try:
+        _ur.urlopen(base + "/agentdiet-summary", timeout=5).read()
+    except Exception:
+        pass
+    try:
+        proc.terminate()
+        proc.wait(timeout=15)
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+
+def _merge_side_calls(run_dir: Path, jsonl: Path, key: str) -> None:
+    """Side model calls a method makes during the session (AgentDiet's
+    reflection calls: one headless Claude Code session each, usage logged
+    per call in `jsonl`) are part of the cell's cost. Keep the raw main
+    record as result_main.json and make result.json the merged record
+    (usage / modelUsage / cost / durations summed; turns stay the agent's),
+    with a `key` block carrying the method's own counters."""
+    def _parse(p):
+        try:
+            return json.loads(p.read_text("utf-8") or "{}")
+        except Exception:
+            return {}
+    main = _parse(run_dir / "result.json")
+    if not main:
+        return
+    recs = []
+    try:
+        for line in jsonl.read_text("utf-8").splitlines():
+            if line.strip():
+                recs.append(json.loads(line))
+    except OSError:
+        pass
+    (run_dir / "result_main.json").write_text(json.dumps(main, indent=2), "utf-8")
+    merged = dict(main)
+    side = {}
+    for r in recs:
+        for k in ("usage", "modelUsage", "total_cost_usd", "duration_ms"):
+            if r.get(k) is not None:
+                side[k] = _sum_numeric(side[k], r[k]) if k in side else r[k]
+    for k, v in side.items():
+        merged[k] = _sum_numeric(v, main[k]) if k in main else v
+    summary = _parse(run_dir / ("%s_summary.json" % key))
+    merged[key] = {
+        "side_calls": len(recs),
+        "side_errors": sum(1 for r in recs if r.get("error") or r.get("is_error")),
+        "side_usage": side.get("usage"), "side_cost": side.get("total_cost_usd"),
+        "side_duration_ms": side.get("duration_ms"),
+        "main_cost": main.get("total_cost_usd"), "main_usage": main.get("usage"),
+        "summary": summary}
+    (run_dir / "result.json").write_text(json.dumps(merged, indent=2), "utf-8")
+
+
+def _merge_pre_stage(run_dir: Path, stage_dir: Path, key: str) -> None:
+    """A stage that ran BEFORE the main session in its own headless Claude
+    Code session (own claude-home, own result.json in stage_dir -- e.g. the
+    SHERLOC localization pass) is part of the cell's cost. Keep the raw main
+    record as result_main.json and make result.json the merged record
+    (usage / modelUsage / cost / turns / durations summed, outcome fields
+    from the main session), like the relay legs, so every downstream reader
+    sees the whole cell. Missing/unparsable stage records are recorded, not
+    fatal."""
+    def _parse(p):
+        try:
+            return json.loads(p.read_text("utf-8") or "{}")
+        except Exception:
+            return {}
+    main = _parse(run_dir / "result.json")
+    st = _parse(stage_dir / "result.json")
+    if not main:
+        return
+    (run_dir / "result_main.json").write_text(json.dumps(main, indent=2), "utf-8")
+    merged = dict(main)
+    for k in ("usage", "modelUsage", "total_cost_usd", "num_turns",
+              "duration_ms", "duration_api_ms"):
+        if k in st and k in main:
+            merged[k] = _sum_numeric(st[k], main[k])   # main's non-numerics win
+        elif k in st:
+            merged[k] = st[k]
+    loc = _parse(stage_dir / "localization.json")
+    merged[key] = {
+        "dir": stage_dir.name, "stage_record": bool(st),
+        "stage_subtype": st.get("subtype"), "stage_turns": st.get("num_turns"),
+        "stage_cost": st.get("total_cost_usd"), "stage_usage": st.get("usage"),
+        "stage_duration_ms": st.get("duration_ms"),
+        "status": loc.get("status"), "reason": loc.get("reason"),
+        "n_tool_calls": loc.get("n_tool_calls"),
+        "n_locations": len(loc.get("locations") or []),
+        "has_findings": bool(loc.get("findings")),
+        "main_turns": main.get("num_turns"), "main_cost": main.get("total_cost_usd")}
+    (run_dir / "result.json").write_text(json.dumps(merged, indent=2), "utf-8")
 
 
 def run_agent(inst: dict[str, Any], run_dir: Path, *, claude_bin: str,
@@ -1041,12 +1361,25 @@ def run_agent(inst: dict[str, Any], run_dir: Path, *, claude_bin: str,
               gate_settings_file: Optional[Path] = None,
               skill_md: Optional[str] = None,
               sentinel: Optional[str] = None,
+              stock_tool_search: bool = False,
+              tools_override: Optional[str] = None,
+              rtk_path: Optional[Path] = None,
               plugin_dir: Optional[Path] = None,
+              lingua_proxy: bool = False,
+              selctx_proxy: bool = False,
+              mask_proxy: bool = False,
+              turn_reminder_cap: Optional[int] = None,
+              turn_extension: Optional[int] = None,
               cbmem_dirs: bool = False,
               cbmem_payload: bool = False,
+              claudemd_file: Optional[Path] = None,
               claudemd_root_file: Optional[Path] = None,
               extra_disallowed: Optional[str] = None,
-              cmv_relay: bool = False) -> dict[str, Any]:
+              squeez_task: Optional[str] = None,
+              cmv_relay: bool = False,
+              pre_stage_dir: Optional[Path] = None,
+              agentdiet_proxy: bool = False,
+              seerepo_proxy: bool = False) -> dict[str, Any]:
     """Run the agent in ``worktree`` (already prepared + maps built), extract the
     patch. If ``worktree`` is None, prepare a fresh one (standalone use).
 
@@ -1076,7 +1409,7 @@ def run_agent(inst: dict[str, Any], run_dir: Path, *, claude_bin: str,
     if cbmem_payload:
         # baseline_cbmem2: the tool's own Claude Code install payload (skill,
         # agents, hooks) in the per-cell claude-home; hook wiring via
-        # --settings.
+        # --settings (same mechanism as the RTK/CMV arms).
         cbm_settings = _lay_cbmem_payload(run_dir, home)
         if gate_settings_file is None:
             gate_settings_file = cbm_settings
@@ -1089,7 +1422,13 @@ def run_agent(inst: dict[str, Any], run_dir: Path, *, claude_bin: str,
     # (never demoted to a searchable bucket) -- this is why LinuxFLBench's rep
     # tools were always active without --tools or a ToolSearch step. Plus the
     # autoupdater + run-id/run-dir env vars LinuxFLBench set.
-    env["ENABLE_TOOL_SEARCH"] = "false"
+    # baseline_pure (2026-08-24): stock_tool_search=True leaves the CLI's
+    # OUT-OF-THE-BOX deferred-tools behavior untouched (the env var is not
+    # set at all) -- the "just plain Claude Code" control arm.
+    if stock_tool_search:
+        env.pop("ENABLE_TOOL_SEARCH", None)   # truly stock: not inherited
+    else:
+        env["ENABLE_TOOL_SEARCH"] = "false"
     env["DISABLE_AUTOUPDATER"] = "1"
     env["RUN_ID"] = run_dir.name
     env["RUN_DIR"] = str(run_dir)
@@ -1114,18 +1453,71 @@ def run_agent(inst: dict[str, Any], run_dir: Path, *, claude_bin: str,
     userbase.mkdir(parents=True, exist_ok=True)
     env["PYTHONUSERBASE"] = str(userbase)
     env["PIP_USER"] = "0"
-    # -- related-work arms ---------------------------------------------------
+    # RTK comparator arm: the tool's PreToolUse hook rewrites Bash commands
+    # to `rtk <cmd>`, so the binary must be resolvable in the agent's PATH.
+    # Only this arm's settings file installs the hook, so adding the dir to
+    # PATH is inert for every other arm (nothing ever calls `rtk`).
+    if rtk_path:
+        env["PATH"] = "%s:%s" % (str(Path(rtk_path).parent),
+                                 env.get("PATH", ""))
+        env["RTK_TELEMETRY_DISABLED"] = "1"
+    # LLMLingua-2 comparator arm (arXiv 2403.12968): route API traffic
+    # through the local compression proxy (tools/lingua_proxy.py). Auth,
+    # streaming, and everything except stale tool_result text passes
+    # through verbatim. Cache-prefix invalidation is inherent to history
+    # rewriting -- report cache_creation + billed $ for this arm (T3).
+    if lingua_proxy:
+        env["ANTHROPIC_BASE_URL"] = "http://127.0.0.1:%s" % os.environ.get(
+            "LINGUA_PROXY_PORT", "8877")
+    if selctx_proxy:
+        env["ANTHROPIC_BASE_URL"] = "http://127.0.0.1:%s" % os.environ.get(
+            "SELCTX_PROXY_PORT", "8878")
+    # observation-masking arm (Complexity Trap mechanism, arXiv 2508.21433,
+    # SWE-agent LastNObservations n=10 ported as a proxy; tools/mask_proxy.py)
+    if mask_proxy:
+        env["ANTHROPIC_BASE_URL"] = "http://127.0.0.1:%s" % os.environ.get(
+            "MASK_PROXY_PORT", "8879")
+    # AgentDiet comparator arm (arXiv 2509.23586, FSE'26): their trajectory
+    # reduction as a per-cell proxy (tools/agentdiet_proxy.py); the proxy's
+    # reflection calls are headless Claude Code sessions whose usage is
+    # merged into result.json after the run (_merge_side_calls).
+    agentdiet = None
+    if agentdiet_proxy:
+        agentdiet = _start_agentdiet_proxy(run_dir, claude_bin, model, effort)
+        env["ANTHROPIC_BASE_URL"] = agentdiet[1]
+    # SeeRepo arm (arXiv 2606.14061): their runner shows each graph image
+    # exactly once (older image messages become a placeholder before every
+    # query); the per-cell proxy replays that on Claude Code's history.
+    seerepo = None
+    if seerepo_proxy:
+        seerepo = _start_seerepo_proxy(run_dir)
+        env["ANTHROPIC_BASE_URL"] = seerepo[1]
+    # Codebase-Memory arm: per-cell index/runtime dirs (full isolation; the
+    # MCP server inherits this env and finds the pre-built index).
     if cbmem_dirs:
-        env.update(cbmem_env(run_dir, worktree))
-    if plugin_dir:
-        # ContextSniper: ripgrep must be on PATH for their candidate collector
-        # (`rg -l -F`); ~/.local/bin is where a static rg usually lives.
-        env["PATH"] = str(Path.home() / ".local" / "bin") + os.pathsep + env.get("PATH", "")
-        env.update(csniper_env(run_dir, worktree))
-    if cmv_relay:
-        # the relay hook resolves node + the CMV entry from these
-        env["CMV_NODE_BIN"] = str(NODE_BIN)
-        env["CMV_ENTRY"] = str(CMV_ENTRY)
+        import hashlib as _hl
+        env["CBM_CACHE_DIR"] = str(run_dir / "cbm_cache")
+        # runtime dir holds a unix socket: sun_path ~108-char limit means it
+        # must be SHORT; same hash rule as the pre-index step in run_cell.
+        env["CBM_RUNTIME_DIR"] = "/tmp/cbmrt_%s" % _hl.md5(
+            str(run_dir).encode()).hexdigest()[:10]
+        env["CBM_LOG_LEVEL"] = "error"
+        # The shipped hooks (hook-augment) enforce a 2000 ms in-process
+        # deadline and exit SILENTLY past it; on this box every invocation
+        # takes 2.0-2.5 s, so all 36 hook calls of the first smokes died
+        # (~/.cache/codebase-memory-mcp/logs/hook-augment-timeouts.log).
+        # The tool's own log says "raise via CBM_HOOK_DEADLINE_MS"; 4500 ms
+        # stays under the 5 s timeout the shipped settings.json gives each
+        # hook. Inherited by the hook processes via the agent env.
+        env["CBM_HOOK_DEADLINE_MS"] = "4500"
+        if worktree is not None:
+            env["CBM_ALLOWED_ROOT"] = str(worktree)
+    # CLAUDE.md arm: lay the per-repo file into the per-cell claude-home as
+    # user memory (loaded at session start; never enters the worktree/diff).
+    if claudemd_file is not None:
+        (home / "CLAUDE.md").write_text(
+            Path(claudemd_file).read_text(encoding="utf-8"),
+            encoding="utf-8")
     # AGENTS.md replication arm (arXiv 2601.20404, baseline_agentsmd): the
     # per-repo file sits at the REPOSITORY ROOT as project memory, exactly
     # where the study's organic AGENTS.md sat. It is removed again before
@@ -1138,6 +1530,131 @@ def run_agent(inst: dict[str, Any], run_dir: Path, *, claude_bin: str,
                 Path(claudemd_root_file).read_text(encoding="utf-8"),
                 encoding="utf-8")
             laid_root_claudemd = True
+    # Squeez arm: per-cell task query for the hook + server endpoint env
+    # for the CLI (both inherited by the hook's rewritten Bash commands).
+    if squeez_task is not None:
+        env["SQUEEZ_TASK"] = squeez_task[:300]
+        env["SQUEEZ_SERVER_URL"] = os.environ.get(
+            "SQUEEZ_SERVER_URL", "http://localhost:8000/v1")
+        env["SQUEEZ_SERVER_MODEL"] = os.environ.get(
+            "SQUEEZ_SERVER_MODEL", "KRLabsOrg/squeez-2b")
+    # ContextSniper comparator arm (arXiv 2607.01916): the plugin is loaded
+    # via --plugin-dir (build_command); here the per-cell runtime env. Their
+    # venv python + built AGFS backend; per-cell local storage inside
+    # run_dir; semantic retrieval OFF (needs an external embedding endpoint
+    # we do not provide -- DISCLOSED fidelity limitation, lexical mode).
+    if plugin_dir:
+        env["PY_BIN"] = str(CSNIPER_ROOT / ".venv" / "bin" / "python")
+        env["AGFS_BIN"] = str(CSNIPER_ROOT / "agfs" / "build" / "agfs-server")
+        env["CONTEXTSNIPER_DIR"] = str(CSNIPER_ROOT)
+        env["CONTEXTSNIPER_LOCAL_STORAGE_DIR"] = str(run_dir / "csniper_store")
+        env["CONTEXTSNIPER_RETRIEVAL_SEMANTIC_ENABLED"] = "0"
+        env["CONTEXTSNIPER_PLUGIN_AUTO_START"] = "1"
+        env["CONTEXTSNIPER_PLUGIN_AUTO_STOP"] = "1"
+        # FILTER condition (the paper's evaluated Claude Code config, per
+        # their scripts/SWE/claude/ContextSniper-FILTER runner): filters +
+        # filtering prompt ON; the code policy is APPENDED TO THE TASK
+        # PROMPT by the runner (run_experiment), not the compose hook.
+        env["CONTEXTSNIPER_FILTER_ENABLED"] = "1"
+        env["CONTEXTSNIPER_FILTER_NATIVE_READ"] = "1"
+        env["CONTEXTSNIPER_FILTER_NATIVE_BASH"] = "1"
+        env["CONTEXTSNIPER_INJECT_FILTERING_PROMPT"] = "1"
+        env["CONTEXTSNIPER_INJECT_CODE_POLICY_ON_SUBMIT"] = "0"
+        env["CONTEXTSNIPER_DISABLE_AFTER_TURN_EXTRACTION"] = "1"
+        env["CONTEXTSNIPER_CODE_TOGGLE"] = "true"
+        env["VECTOR_DB_TYPE"] = "memory"
+        env["CONTEXTSNIPER_SESSION_ID"] = run_dir.name
+        env["CONTEXTSNIPER_PLUGIN_START_WAIT"] = "60"
+        env["MCP_TIMEOUT"] = "120000"
+        if worktree is not None:
+            env["CONTEXTSNIPER_WORKSPACE_ROOT"] = str(worktree)
+        # ---- 2026-09-03 FIDELITY REPAIR (audit of results/swe30_csniper) ----
+        # The first 30-cell run was NOT a faithful ContextSniper run:
+        #  (1) `rg` (ripgrep) was not installed; their candidate collector
+        #      shells out to `rg -l -F` (memory_service._grep_candidate_paths)
+        #      and silently returns [] on FileNotFoundError, so 105/157
+        #      search_code calls returned ZERO candidates (the 52 that hit had
+        #      candidates=1 = the agent named a file). Fixed: static rg
+        #      14.1.1 in ~/.local/bin, prepended to PATH for the plugin.
+        #  (2) EMBEDDING_PROVIDER defaulted to "openai" with no key; the
+        #      backend's write API creates the embedder eagerly, so EVERY
+        #      code_sync_workspace (48), code_refresh_workspace_path after
+        #      edit_file (144), filtered Read/Bash persistence (246) and
+        #      working-set search (48) raised "OpenAI API key is required".
+        #      Fixed: their sentence-transformers provider (see below).
+        #  (3) Shared ~/.cache/contextsniper-claude-plugin runtime across all
+        #      cells (one AGFS store, one log). Their runner isolates each
+        #      task in EXPERIMENT_DIR; we now do the same per cell.
+        #  (4) Their SWE-Pro runner's retrieval knobs (candidate/embed caps,
+        #      snippet cap, ingest, bootstrap caps) differ from the code
+        #      defaults (e.g. ingest OFF, bootstrap cap 0 by default); set
+        #      exactly as scripts/SWE-pro/claude/ContextSniper-FILTER/run_*.sh.
+        env["PATH"] = str(Path.home() / ".local" / "bin") + os.pathsep + env.get("PATH", "")
+        # Embedder: their in-tree sentence-transformers provider with their
+        # default model (providers/config.py st_model = "BAAI/bge-m3"), CPU
+        # torch, weights cached under ~/.cache/huggingface (offline). Real
+        # embeddings keep the compose hook's "Retrieved Memories" block and
+        # the memory index semantically meaningful (a mock embedder made the
+        # prompt-time working set random). Semantic FUSION in search_code
+        # stays OFF (CONTEXTSNIPER_RETRIEVAL_SEMANTIC_ENABLED=0 above = their
+        # release default; the paper's Claude Code section names no embedding
+        # model) -- embeddings only feed the memory store, never the ranking.
+        env["EMBEDDING_PROVIDER"] = "st"
+        env["ST_MODEL"] = "BAAI/bge-m3"
+        env["HF_HUB_OFFLINE"] = "1"
+        env["TRANSFORMERS_OFFLINE"] = "1"
+        env["TOKENIZERS_PARALLELISM"] = "false"
+        # 2026-09-03: the first swe30_csniper220 attempt was OOM-killed three
+        # times (kernel: "Out of memory: Killed process ... anon-rss 10.6GB"
+        # in a 12GB WSL VM).  bge-m3 is a 4.3GB checkpoint and CPU torch
+        # defaults to one BLAS thread per core, each with its own arena, so
+        # the backend's peak scales with core count rather than model size.
+        # Cap the thread pools; this changes speed, never retrieval output
+        # (same weights, same vectors, deterministic).
+        env["OMP_NUM_THREADS"] = "2"
+        env["MKL_NUM_THREADS"] = "2"
+        env["OPENBLAS_NUM_THREADS"] = "2"
+        env["TORCH_NUM_THREADS"] = "2"
+        # Embedding BATCH caps (2026-09-03, second OOM guard): their service
+        # sends up to 512 texts / 100K tokens per encoder call
+        # (memory_service.py:1740-1747 defaults) and bge-m3 pads to the
+        # longest text (max_seq_length 8192), so the backend peaked at
+        # 9.3GB on the first openlibrary cell. Each text's vector is computed
+        # independently -- batch size changes peak memory and speed only,
+        # never the stored embeddings -- so this is fidelity-neutral.
+        env["CONTEXTSNIPER_CODE_SEARCH_EMBED_BATCH_TEXTS"] = "16"
+        env["CONTEXTSNIPER_CODE_SEARCH_EMBED_BATCH_TOKENS"] = "8000"
+        env["CONTEXTSNIPER_RUNTIME_DIR"] = str(run_dir / "csniper_runtime")
+        env["CONTEXTSNIPER_STORAGE_BACKEND"] = "agfs"
+        env["CONTEXTSNIPER_CODE_TOGGLE_FORCE"] = "true"
+        env["CONTEXTSNIPER_RETRIEVAL_GRAPH_ENABLED"] = "1"
+        env["CONTEXTSNIPER_RETRIEVAL_SYMBOLIC_ENABLED"] = "1"
+        env["CONTEXTSNIPER_RETRIEVAL_FREQUENCY_ENABLED"] = "1"
+        env["CONTEXTSNIPER_CODE_SEARCH_CANDIDATE_MAX_FILES"] = "40"
+        env["CONTEXTSNIPER_CODE_SEARCH_EMBED_MAX_FILES"] = "20"
+        env["CONTEXTSNIPER_CODE_SEARCH_MAX_SNIPPETS"] = "250"
+        # 2026-09-04 OOM bound: candidate/embed/snippet caps lowered from their
+        # SWE-Pro runner's 80/80/500 to 40/20/250 after openlibrary-910b0857
+        # drove the backend to 11.9GB (7 searches x 80 candidate files each).
+        # Narrows retrieval breadth -> conservative against ContextSniper.
+        env["CONTEXTSNIPER_CODE_SEARCH_INGEST_CANDIDATES"] = "1"
+        env["CONTEXTSNIPER_CODE_SEARCH_INGEST_ASYNC"] = "1"
+        env["CONTEXTSNIPER_CODE_SEARCH_INGEST_MAX_FILES"] = "3"
+        env["CONTEXTSNIPER_CODE_SEARCH_INGEST_MAX_CHUNKS"] = "40"
+        env["CONTEXTSNIPER_CODE_SEARCH_INGEST_WORKERS"] = "2"
+        env["CONTEXTSNIPER_CODE_FUSE_MODE"] = "weighted_rrf"
+        env["CONTEXTSNIPER_CODE_FUSE_W_EMBED"] = "0.33"
+        env["CONTEXTSNIPER_CODE_FUSE_W_BM25"] = "0.17"
+        env["CONTEXTSNIPER_CODE_FUSE_W_CTAGS"] = "0.17"
+        env["CONTEXTSNIPER_CODE_FUSE_W_GRAPH"] = "0.33"
+        env["CONTEXTSNIPER_BOOTSTRAP_MAX_FILES"] = "40"
+        env["CONTEXTSNIPER_BOOTSTRAP_FULL_INDEX_CAP_FILES"] = "40"
+        env["CONTEXTSNIPER_SWE_COPY_AGFS_RUNTIME"] = "1"
+        env["CONTEXTSNIPER_ACCOUNT_ID"] = "acct-demo-r0"
+        env["CONTEXTSNIPER_USER_ID"] = "u-claude-r0"
+        env["CONTEXTSNIPER_AGENT_ID"] = "claude-code-r0"
+        env["NO_PROXY"] = "127.0.0.1,localhost,::1"
+        env["no_proxy"] = env["NO_PROXY"]
     if extra_env:
         env.update(extra_env)
 
@@ -1148,16 +1665,32 @@ def run_agent(inst: dict[str, Any], run_dir: Path, *, claude_bin: str,
     # are created -- comparability with every completed run.
     test_shim_info = None
     if env.get("REPR_TEST_SHIM") == "1":
-        test_shim_info = setup_test_shim(run_dir, env)
+        from experiments.common import testenv_ladder
+        test_shim_info = setup_test_shim(
+            run_dir, env, repo=wt,
+            cache_key="%s@%s" % (inst.get("repo", "?"),
+                                 str(inst.get("base_commit", "?"))[:12]),
+            image=("%s:%s" % (testenv_ladder.DOCKER_REGISTRY,
+                              inst["dockerhub_tag"])
+                   if inst.get("dockerhub_tag") else None),
+            instance_id=inst.get("instance_id"))
 
     if cbmem_payload:
         # Warm per-cell CBM daemon (the tool's documented steady state: the
-        # shipped hooks only produce context while one is running; in a cold
-        # `-p` session the SessionStart hook fires BEFORE the MCP server
-        # starts the daemon). Own UI port per cell so concurrent daemons do
-        # not collide; stopped after the agent. Logged to cbmem_daemon.log.
+        # daemon is "permanent", survives session ends, and the shipped hooks
+        # only produce context while one is running). In a cold `-p` session
+        # the SessionStart hook fires BEFORE the MCP server starts the daemon
+        # and emits nothing (verified 2026-09-03: same hook yields the
+        # "[codebase-memory] Session context ..." reminder once a daemon is
+        # warm). Started with the per-cell CBM_* env, UI disabled (the UI
+        # port is shared and concurrent cells would collide), stopped after
+        # the agent. Logged to run_dir/cbmem_daemon.log.
         try:
-            port = 20000 + int(hashlib.md5(str(run_dir).encode()).hexdigest()[:4],
+            # `daemon start` accepts only --open / --port=N: give each cell
+            # its own UI port (derived from the run_dir hash) so concurrent
+            # daemons never fight over the default 9749.
+            import hashlib as _hl
+            port = 20000 + int(_hl.md5(str(run_dir).encode()).hexdigest()[:4],
                                16) % 20000
             d = subprocess.run([str(CBMEM_BIN), "daemon", "start",
                                 "--port=%d" % port],
@@ -1174,6 +1707,7 @@ def run_agent(inst: dict[str, Any], run_dir: Path, *, claude_bin: str,
                         max_budget_usd, mcp_config, system_prompt_file,
                         restrict_tools=restrict_tools,
                         settings_file=gate_settings_file,
+                        tools_override=tools_override,
                         plugin_dir=plugin_dir,
                         extra_disallowed=extra_disallowed)
     meta = {"instance_id": inst["instance_id"], "repo": inst["repo"],
@@ -1202,12 +1736,43 @@ def run_agent(inst: dict[str, Any], run_dir: Path, *, claude_bin: str,
             e.stdout, str) else "", "utf-8")
         rc = -1
 
+    if turn_extension and not timed_out:
+        # dynamic-turn arm: one-time buffer when stage 1 hit its cap
+        rc = _turn_extension_stage(run_dir, cmd, env, wt, inst, rc,
+                                   turn_reminder_cap or max_turns,
+                                   turn_extension, timeout_sec)
+
     if cmv_relay and not timed_out:
         # baseline_cmv2: stop-and-resume relay on every CMV trim, so the
         # trimmed transcript is what the model actually sees.
         rc, timed_out = _cmv_relay_stages(run_dir, cmd, env, wt, rc,
                                           max_turns, max_budget_usd,
                                           timeout_sec)
+
+    if pre_stage_dir is not None:
+        # baseline_sherloc: the localization session that ran before this
+        # one is part of the cell -- fold its usage / cost / turns in.
+        _merge_pre_stage(run_dir, Path(pre_stage_dir), Path(pre_stage_dir).name)
+
+    if agentdiet is not None:
+        # baseline_agentdiet: stop the per-cell proxy (it writes
+        # agentdiet_summary.json on the way out) and fold the reflection
+        # calls' usage into result.json.
+        _stop_agentdiet_proxy(*agentdiet)
+        _merge_side_calls(run_dir, run_dir / "agentdiet_reflections.jsonl",
+                          "agentdiet")
+
+    if seerepo is not None:
+        # baseline_seerepo: stop the per-cell image-elision proxy (no side
+        # calls to merge; its log is seerepo_elisions.jsonl).
+        try:
+            seerepo[0].terminate()
+            seerepo[0].wait(timeout=15)
+        except Exception:
+            try:
+                seerepo[0].kill()
+            except Exception:
+                pass
 
     # harvest the session transcript (for MCP/tool-usage telemetry) from the
     # per-run claude-home before extracting the patch.
