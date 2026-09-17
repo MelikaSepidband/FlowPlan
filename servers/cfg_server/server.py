@@ -25,7 +25,9 @@ implementation annotations must be real objects for FastMCP schema
 generation (INTERFACES.md section 8).
 """
 
+import ast as _pyast
 import itertools
+import os
 import re
 import sqlite3
 import time
@@ -447,6 +449,165 @@ def _parse_anchor(spec: str) -> Optional[tuple[str, int]]:
     return path_part.replace("\\", "/"), int(line_part)
 
 
+# -- live-file fallback: agent-written code ----------------------------------
+#
+# symbols.db is a build-time snapshot, so functions the AGENT writes during a
+# run -- a new def Edited into an indexed file, or a brand-new file Written
+# whole -- do not exist in it, and resolution returned null on code that
+# existed in the worktree at call time (2026-08-21 calls10 audit, GRAPH_WRONG
+# cells 2dd8966f/7e1a3476). The staleness disclosure cannot even see the
+# second case: Manifest.check only stats manifest entries, so a brand-new
+# file reports stale_files=0. The fallback runs ONLY on a resolution miss:
+# anchored specs re-parse the named file; bare names re-parse the (bounded)
+# set of files changed or created since index build. Python-only -- C keeps
+# the index/Joern path.
+
+# path -> (mtime_ns, size, rows); reparse only when the file changes
+_LIVE_ROW_CACHE: dict[str, tuple[int, int, list[dict]]] = {}
+# throttle for the new-file walk: (monotonic_stamp, rel_paths)
+_LIVE_SCAN_CACHE: dict = {"stamp": 0.0, "rels": []}
+_LIVE_SCAN_TTL = 5.0
+_LIVE_PARSE_CAP = 50
+_LIVE_SKIP_DIRS = {".git", "__pycache__", ".venv", "venv", "node_modules",
+                   ".tox", ".mypy_cache", ".pytest_cache", ".repr_index"}
+
+
+def _live_module_qualname(rel: str) -> str:
+    """Dotted module path for a repo-relative posix path (symbols.db
+    convention -- mirrors indexer.backends.symbols.module_qualname)."""
+    stem = rel[:-3] if rel.endswith(".py") else rel
+    parts = [p for p in stem.split("/") if p]
+    if parts and parts[-1] == "__init__":
+        parts = parts[:-1]
+    if not parts:
+        parts = ["__init__"]
+    return ".".join(parts)
+
+
+def _live_rows_for_file(rel: str) -> list[dict]:
+    """Symbol rows parsed from ONE live .py file (indexed or not).
+
+    Row shape and qualname convention match _load_function_rows so callers
+    can mix db and live rows freely. [] on any failure -- the caller falls
+    through to its normal miss handling."""
+    rel = rel.replace("\\", "/").lstrip("/")
+    if not rel.endswith(".py"):
+        return []
+    path = env.repo_root() / rel
+    try:
+        st = path.stat()
+    except OSError:
+        # the spec may name the file by a path SUFFIX (db filtering allows
+        # that); look for a changed/new file ending in it
+        tail = "/" + rel
+        for cand in _changed_or_new_py_rels():
+            if cand == rel or cand.endswith(tail):
+                rel, path = cand, env.repo_root() / cand
+                break
+        else:
+            return []
+        try:
+            st = path.stat()
+        except OSError:
+            return []
+    key = str(path)
+    cached = _LIVE_ROW_CACHE.get(key)
+    if cached is not None and cached[0] == st.st_mtime_ns \
+            and cached[1] == st.st_size:
+        return cached[2]
+    try:
+        tree = _pyast.parse(path.read_text(encoding="utf-8",
+                                           errors="replace"))
+    except (SyntaxError, ValueError, OSError):
+        _LIVE_ROW_CACHE[key] = (st.st_mtime_ns, st.st_size, [])
+        return []
+    modq = _live_module_qualname(rel)
+    rows: list[dict] = []
+
+    def walk(node, scope: str) -> None:
+        for child in _pyast.iter_child_nodes(node):
+            if isinstance(child, (_pyast.FunctionDef,
+                                  _pyast.AsyncFunctionDef)):
+                qual = scope + "." + child.name
+                rows.append({
+                    "name": child.name,
+                    "qualname": qual,
+                    "file": rel,
+                    "line": child.lineno,
+                    "end_line": getattr(child, "end_lineno", None)
+                    or child.lineno,
+                })
+                walk(child, qual)
+            elif isinstance(child, _pyast.ClassDef):
+                walk(child, scope + "." + child.name)
+            else:
+                walk(child, scope)
+
+    walk(tree, modq)
+    _LIVE_ROW_CACHE[key] = (st.st_mtime_ns, st.st_size, rows)
+    return rows
+
+
+def _changed_or_new_py_rels() -> list[str]:
+    """Repo-relative .py files changed or created since index build.
+
+    Manifest drift (cheap stats) finds edited files; a pruned walk finds
+    files the manifest has never heard of. Result cached briefly -- this
+    only runs on a resolution miss, but misses can cluster."""
+    now = time.monotonic()
+    if now - _LIVE_SCAN_CACHE["stamp"] < _LIVE_SCAN_TTL:
+        return _LIVE_SCAN_CACHE["rels"]
+    root = env.repo_root()
+    manifest = None
+    try:
+        manifest = staleness.Manifest.load(env.index_dir())
+    except Exception:
+        manifest = None
+    known = dict(manifest.files) if manifest is not None else {}
+    changed: list[tuple[float, str]] = []
+    for rel, entry in known.items():
+        if not rel.endswith(".py"):
+            continue
+        try:
+            st = (root / rel).stat()
+        except OSError:
+            continue
+        if st.st_size != entry.get("size") \
+                or st.st_mtime != entry.get("mtime"):
+            changed.append((st.st_mtime, rel))
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in _LIVE_SKIP_DIRS]
+        for fname in filenames:
+            if not fname.endswith(".py"):
+                continue
+            p = Path(dirpath) / fname
+            try:
+                rel = p.relative_to(root).as_posix()
+            except ValueError:
+                continue
+            if rel in known:
+                continue
+            try:
+                changed.append((p.stat().st_mtime, rel))
+            except OSError:
+                continue
+    # newest first; cap so a pathological worktree cannot trigger a
+    # repo-wide parse storm (agents touch a handful of files per run)
+    changed.sort(reverse=True)
+    rels = [rel for _mt, rel in changed[:_LIVE_PARSE_CAP]]
+    _LIVE_SCAN_CACHE["stamp"] = now
+    _LIVE_SCAN_CACHE["rels"] = rels
+    return rels
+
+
+def _live_changed_rows() -> list[dict]:
+    """Rows from every file changed/created since index build (bounded)."""
+    rows: list[dict] = []
+    for rel in _changed_or_new_py_rels():
+        rows.extend(_live_rows_for_file(rel))
+    return rows
+
+
 def _resolve_functions(spec: str, file: Optional[str] = None) -> list[dict]:
     """Resolve a bare name, qualname (or suffix), or anchor to symbol rows.
 
@@ -465,15 +626,26 @@ def _resolve_functions(spec: str, file: Optional[str] = None) -> list[dict]:
             for row in rows
             if row["file"] == rel or row["file"].endswith("/" + rel)
         ]
+        if not rows:
+            # a file the index has never seen (agent-Written mid-run)
+            rows = _live_rows_for_file(rel)
     anchor = _parse_anchor(text)
     if anchor is not None:
         path, line = anchor
-        containing = [
-            row
-            for row in rows
-            if (row["file"] == path or row["file"].endswith("/" + path))
-            and row["line"] <= line <= row["end_line"]
-        ]
+
+        def _containing(cand_rows):
+            return [
+                row
+                for row in cand_rows
+                if (row["file"] == path or row["file"].endswith("/" + path))
+                and row["line"] <= line <= row["end_line"]
+            ]
+
+        containing = _containing(rows)
+        if not containing:
+            # live fallback: the anchored line may sit in a function the
+            # agent just wrote (new def in an indexed file, or a new file)
+            containing = _containing(_live_rows_for_file(path))
         if containing:
             return [max(containing, key=lambda row: row["line"])]
         raise ValueError(f"no function found at anchor {text!r}")
@@ -497,33 +669,48 @@ def _resolve_functions(spec: str, file: Optional[str] = None) -> list[dict]:
             seen.add(key)
             matches.append(row)
 
-    for row in rows:
-        if row["qualname"] == text:
-            _add(row)
-    for row in rows:
-        if row["name"] == text:
-            _add(row)
-    if "." in text:
-        suffix = "." + text
-        for row in rows:
-            if row["qualname"].endswith(suffix):
+    def _match_names(cand_rows) -> None:
+        for row in cand_rows:
+            if row["qualname"] == text:
                 _add(row)
-    # C++ ``Class::method`` handling: rows may be indexed either qualified
-    # (out-of-class defs -> "Class::method") or bare (in-class defs ->
-    # "method"). Match in both directions on the last ``::`` component so the
-    # agent's chosen form resolves regardless of how the def was written.
-    if "::" in text:
-        last = text.rsplit("::", 1)[-1]
-        for row in rows:
-            rn, rq = row["name"], row["qualname"]
-            if (rn == last or rq == last
-                    or rq.endswith("::" + text) or text.endswith("::" + rn)):
+        for row in cand_rows:
+            if row["name"] == text:
                 _add(row)
-    elif text:
-        # bare name: also match a qualified row whose final component equals it
-        for row in rows:
-            if row["qualname"].endswith("::" + text):
-                _add(row)
+        if "." in text:
+            suffix = "." + text
+            for row in cand_rows:
+                if row["qualname"].endswith(suffix):
+                    _add(row)
+        # C++ ``Class::method`` handling: rows may be indexed either
+        # qualified (out-of-class defs -> "Class::method") or bare (in-class
+        # defs -> "method"). Match in both directions on the last ``::``
+        # component so the agent's chosen form resolves regardless of how
+        # the def was written.
+        if "::" in text:
+            last = text.rsplit("::", 1)[-1]
+            for row in cand_rows:
+                rn, rq = row["name"], row["qualname"]
+                if (rn == last or rq == last
+                        or rq.endswith("::" + text)
+                        or text.endswith("::" + rn)):
+                    _add(row)
+        elif text:
+            # bare name: also match a qualified row whose final component
+            # equals it
+            for row in cand_rows:
+                if row["qualname"].endswith("::" + text):
+                    _add(row)
+
+    _match_names(rows)
+    if not matches:
+        # live fallback: the name may belong to code the agent just wrote
+        # (not in the build-time snapshot). File-scoped queries re-parse
+        # that file (covers a new def Edited into an indexed file); bare
+        # names scan only files changed/created since index build.
+        if file:
+            _match_names(_live_rows_for_file(file.replace("\\", "/")))
+        else:
+            _match_names(_live_changed_rows())
     if not matches:
         raise ValueError(
             f"no function matching {spec!r} in the symbol index; "

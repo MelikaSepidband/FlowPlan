@@ -970,14 +970,7 @@ def run_cell(inst: dict, condition: str, results_dir: Path, args) -> dict:
     # <rep>_explore organically -- no ToolSearch round-trip, no steer prompt
     # needed. Only the tool-bearing conditions get the restriction.
     is_tool_cell = (mcp_config is not None)
-    # baseline_lean (2026-08-21 forensics): the tool-surface CONTROL -- plain
-    # baseline (no MCP, no skill, same prompt) but with the SAME --tools
-    # restriction the MCP arms get. The unrestricted baseline carries ~20K
-    # more prefix tokens per API call (26 built-ins + skill/agent listings,
-    # and no Grep/Glob at all), which alone accounts for ~40% of the
-    # flow-arm token gap; this arm isolates the process effect from it.
-    restrict = ((is_tool_cell and not args.no_restrict_tools)
-                or condition == "baseline_lean")
+    restrict = is_tool_cell and not args.no_restrict_tools
 
     # Optional belt-and-suspenders steer (off by default now that --tools keeps
     # the tools active); kept behind --steer for ablations.
@@ -1438,10 +1431,6 @@ def run_cell(inst: dict, condition: str, results_dir: Path, args) -> dict:
             prompt_override=flow3_prompt or comparator_prompt_override,
             skill_md=flow3_skill_md,
             sentinel=flow3_sentinel, gate_settings_file=gate_settings,
-            # baseline_pure: leave the CLI's stock deferred-tools/tool-search
-            # behavior untouched (no ENABLE_TOOL_SEARCH=false, no --tools) --
-            # "just plain Claude Code" apart from the web ban + budget caps.
-            stock_tool_search=(condition == "baseline_pure"),
             rtk_path=(agent.RTK_BIN if condition == "baseline_rtk" else None),
             plugin_dir=(agent.CSNIPER_PLUGIN
                         if condition == "baseline_csniper" else None),
@@ -1881,8 +1870,14 @@ def main(argv=None):
     # rep but matches no arm predicate, falls through to the MAP arm, and
     # perrep.build's SystemExit("unknown rep") -- a BaseException -- then
     # aborts the WHOLE batch mid-run instead of failing one cell.
-    from perrep import build as perrep_build
-    _literal = {"baseline", "baseline_lean", "baseline_pure", "codegraph",
+    # The repository-map builders (perrep.build, the explore/node arms of the
+    # earlier code-representation study) are not part of this release: the
+    # flow arms are map-free. Import lazily so the runner starts without them.
+    try:
+        from perrep import build as perrep_build
+    except ImportError:
+        perrep_build = None
+    _literal = {"baseline", "codegraph",
                 "memory_hybrid", "memory_strategy", "memory_text",
                 "memory_combo", "memory_rerank",
                 # published prompt-lever comparator arms (2026-08-31)
@@ -1965,7 +1960,8 @@ def main(argv=None):
         is_map_free = (condition_flow_first(cond) or condition_flow_v3(cond)
                        or condition_nlplan(cond) or condition_flowonly(cond)
                        or condition_graphfirst(cond))
-        if not is_map_free and rep not in perrep_build.REPS:
+        if not is_map_free and (perrep_build is None
+                                or rep not in perrep_build.REPS):
             raise SystemExit(
                 "[swebench] condition %r needs a rep map, but rep %r has no "
                 "map builder (flow3-only rep?). Did you mean "

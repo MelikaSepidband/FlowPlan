@@ -1361,7 +1361,6 @@ def run_agent(inst: dict[str, Any], run_dir: Path, *, claude_bin: str,
               gate_settings_file: Optional[Path] = None,
               skill_md: Optional[str] = None,
               sentinel: Optional[str] = None,
-              stock_tool_search: bool = False,
               tools_override: Optional[str] = None,
               rtk_path: Optional[Path] = None,
               plugin_dir: Optional[Path] = None,
@@ -1422,13 +1421,7 @@ def run_agent(inst: dict[str, Any], run_dir: Path, *, claude_bin: str,
     # (never demoted to a searchable bucket) -- this is why LinuxFLBench's rep
     # tools were always active without --tools or a ToolSearch step. Plus the
     # autoupdater + run-id/run-dir env vars LinuxFLBench set.
-    # baseline_pure (2026-08-24): stock_tool_search=True leaves the CLI's
-    # OUT-OF-THE-BOX deferred-tools behavior untouched (the env var is not
-    # set at all) -- the "just plain Claude Code" control arm.
-    if stock_tool_search:
-        env.pop("ENABLE_TOOL_SEARCH", None)   # truly stock: not inherited
-    else:
-        env["ENABLE_TOOL_SEARCH"] = "false"
+    env["ENABLE_TOOL_SEARCH"] = "false"
     env["DISABLE_AUTOUPDATER"] = "1"
     env["RUN_ID"] = run_dir.name
     env["RUN_DIR"] = str(run_dir)

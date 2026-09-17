@@ -150,6 +150,44 @@ class ModuleDFG:
                     continue
                 pairs.add((var, line, use_line))
                 uses.add(Anchor(line=use_line, var=var, is_def=False))
+
+        # walrus-in-comprehension recovery: per PEP 572 a NamedExpr target
+        # inside a comprehension binds in the ENCLOSING scope, and beniget
+        # links that hoisted def only to uses AFTER the comprehension -- the
+        # use inside the comprehension itself is left unbound (silently, via
+        # _QuietDefUseChains), so `[y for x in xs if (y := x + 1) > 0]`
+        # dropped y's def->use pair entirely (2026-08-20 fof10 dfg audit,
+        # known limitation now fixed). Supplement: link each walrus target
+        # to the Load names of the same var within its comprehension.
+        _comp_types = (gast.ListComp, gast.SetComp, gast.DictComp,
+                       gast.GeneratorExp)
+        for comp in gast.walk(tree):
+            if not isinstance(comp, _comp_types):
+                continue
+            walrus_lines: dict[str, int] = {}
+            for sub in gast.walk(comp):
+                if isinstance(sub, gast.NamedExpr) \
+                        and isinstance(sub.target, gast.Name):
+                    ln = getattr(sub.target, "lineno", None) \
+                        or getattr(sub, "lineno", None)
+                    if ln is not None:
+                        walrus_lines.setdefault(sub.target.id, ln)
+            if not walrus_lines:
+                continue
+            for sub in gast.walk(comp):
+                if not (isinstance(sub, gast.Name)
+                        and isinstance(sub.ctx, gast.Load)
+                        and sub.id in walrus_lines):
+                    continue
+                use_line = getattr(sub, "lineno", None)
+                if use_line is None:
+                    continue
+                var = sub.id
+                def_line = walrus_lines[var]
+                defs.add(Anchor(line=def_line, var=var, is_def=True))
+                uses.add(Anchor(line=use_line, var=var, is_def=False))
+                pairs.add((var, def_line, use_line))
+
         self.pairs = sorted(pairs)
         self.defs = defs
         self.uses = uses

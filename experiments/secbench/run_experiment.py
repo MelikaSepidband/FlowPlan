@@ -529,7 +529,6 @@ def run_cell(inst: dict, condition: str, results_dir: Path, args) -> dict:
                              "n_crash_in_repo")}), "utf-8")
             mcp_config = write_dynonly_config(wt, run_dir)
         elif rep is not None:
-            from perrep import build as perrep_build
             from indexer.backends import get_backend
             (wt / ".repr_index").mkdir(exist_ok=True)
             get_backend("symbols").build(wt, wt / ".repr_index")
@@ -542,6 +541,9 @@ def run_cell(inst: dict, condition: str, results_dir: Path, args) -> dict:
             # Symbol index + CPG below are still built so flow_of can resolve
             # the report's symbols and render their C CFGs.
             if not map_free:
+                # repository-map arms only (not part of this release: the
+                # flow arms never build a map)
+                from perrep import build as perrep_build
                 perrep_build.build_rep(wt, rep, repr_index=wt / ".repr_index")
             # Build the Joern CPG (scoped to the crash-stack dirs) so the C/C++
             # control-flow tools (get_cfg/cfg_paths/dominators) and the block
