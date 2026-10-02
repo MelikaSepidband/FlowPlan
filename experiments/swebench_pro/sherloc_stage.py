@@ -173,14 +173,18 @@ def injection_block(loc: dict) -> str:
 
 
 # --- per-cell config ---------------------------------------------------------
-def write_mcp_config(stage: Path, snapshot: Path) -> Path:
+def write_mcp_config(stage: Path, snapshot: Path,
+                     file_exts: Optional[tuple] = None) -> Path:
+    env = {"PYTHONPATH": str(STUDY_ROOT),
+           "SHERLOC_SNAPSHOT": str(snapshot),
+           "SHERLOC_SRC": str(STUDY_ROOT / "tools" / "sherloc_src"),
+           "SHERLOC_LOG": str(stage / "sherloc_tools.jsonl")}
+    if file_exts:
+        env["SHERLOC_FILE_EXTENSIONS"] = ",".join(file_exts)
     cfg = {"mcpServers": {"sherloc": {
         "command": str(agent.VENV_PYTHON),
         "args": ["-m", "servers.sherloc_server.server"],
-        "env": {"PYTHONPATH": str(STUDY_ROOT),
-                "SHERLOC_SNAPSHOT": str(snapshot),
-                "SHERLOC_SRC": str(STUDY_ROOT / "tools" / "sherloc_src"),
-                "SHERLOC_LOG": str(stage / "sherloc_tools.jsonl")}}}}
+        "env": env}}}
     p = stage / "mcp.json"
     p.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
     return p
@@ -209,10 +213,18 @@ def _count_calls(stage: Path) -> int:
 # --- the stage -----------------------------------------------------------------
 def run_stage(inst: dict, run_dir: Path, wt: Path, *, claude_bin: str,
               model: str, effort: str, max_budget_usd: float,
-              timeout_sec: int) -> tuple[Optional[str], Path]:
+              timeout_sec: int, problem_text: Optional[str] = None,
+              file_exts: Optional[tuple] = None) -> tuple[Optional[str], Path]:
     """Run the localization session for one cell. Returns (injection block
     or None on failure, stage dir). Never raises: a failure is recorded in
-    stage/localization.json and the repair session runs as baseline."""
+    stage/localization.json and the repair session runs as baseline.
+
+    problem_text / file_exts: benchmark adapters (SecBench). The Problem
+    Description defaults to the SWE-bench Pro task text; SecBench passes its
+    own task text (vulnerability + sanitizer report). file_exts overrides their
+    DEFAULT_FILE_EXTENSIONS ("py", "cfg") -- a config default of their Python
+    benchmarks -- with the C/C++ extensions so the snapshot keeps the sources;
+    the MCP server gets the same list (SHERLOC_FILE_EXTENSIONS)."""
     run_dir = Path(run_dir).resolve()
     stage = run_dir / STAGE_DIRNAME
     stage.mkdir(parents=True, exist_ok=True)
@@ -220,18 +232,23 @@ def run_stage(inst: dict, run_dir: Path, wt: Path, *, claude_bin: str,
                            "locations": [], "raw_final": "", "total_steps": TOTAL_STEPS}
     t0 = time.time()
     try:
-        RepoManager, _Exec, exclude_dirs, file_exts = their_modules()
+        RepoManager, _Exec, exclude_dirs, their_exts = their_modules()
+        if file_exts is None:
+            file_exts = their_exts
+        loc["file_extensions"] = list(file_exts)
         snap_path = stage / "snapshot.pkl"
         snap = build_snapshot(Path(wt), inst["instance_id"], snap_path)
         filtered = RepoManager.filter_repo_dict(snap, exclude_dirs, file_exts)
         tree = RepoManager.tree_repo_dict(filtered, False)
         del snap, filtered
-        prompt = first_turn(problem_description(inst), tree)
+        prompt = first_turn(problem_description(inst) if problem_text is None
+                            else problem_text, tree)
         (stage / "prompt.md").write_text(prompt, encoding="utf-8")
         loc["tree_lines"] = tree.count("\n") + 1
         loc["prompt_chars"] = len(prompt)
 
-        mcp = write_mcp_config(stage, snap_path)
+        mcp = write_mcp_config(stage, snap_path,
+                               file_exts if file_exts is not their_exts else None)
         settings = write_hook_settings(stage)
         home = agent._seed_claude_home(stage)
         env = dict(os.environ)

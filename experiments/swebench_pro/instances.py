@@ -1,4 +1,5 @@
-"""Load + normalize SWE-bench Pro instances from samples/swebench_pro_n253.
+"""Load + normalize SWE-bench Pro instances from samples/swebench_pro_n266
+(the 266 public Python instances; the evaluation sample is data/ids/swebench_pro_158.json).
 
 Each ``instance_*.json`` describes one bug-fix task: a repo at ``base_commit``,
 a natural-language ``problem_statement`` (+ ``requirements`` / ``interface``
@@ -16,7 +17,7 @@ from pathlib import Path
 from typing import Any
 
 STUDY_ROOT = Path(__file__).resolve().parents[2]
-SAMPLES_DIR = STUDY_ROOT / "samples" / "swebench_pro_n253"
+SAMPLES_DIR = STUDY_ROOT / "samples" / "swebench_pro_n266"
 
 REPO_URL = {
     "ansible/ansible": "https://github.com/ansible/ansible.git",

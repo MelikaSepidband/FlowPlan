@@ -105,6 +105,13 @@ If you need to make more changes, continue working as usual.{files_warning}
 
 VIEW_CMDS = ("cat", "grep", "less", "more", "head", "tail")
 TEST_PATTERNS = ("test_", "_test.py", "/test", "verify", "check")
+# C/C++ analog of their "test execution" key steps (EET_LANG=c, SecBench): their
+# detector keys on pytest / `python <test script>`; on a C project the equivalent
+# actions are building and running the reproducer / test binary. Disclosed
+# adaptation; the rest of the detector is their logic.
+C_TEST_CMDS = ("make", "cmake", "ctest", "./configure", "meson", "ninja",
+               "/out/", "fuzzer", "poc", "testcase", "asan", "sanitizer")
+LANG = os.environ.get("EET_LANG", "").strip().lower()
 
 
 def _state_path(run_dir: Path) -> Path:
@@ -215,6 +222,11 @@ def assess_workflow_progress(action: str, output_text: str, returncode: int,
         if returncode == 0 and any(i in o for i in ("passed", "success", "ok", "test passed")):
             if "failed" not in o and "error" not in o:
                 st["test_passed"] = True
+    elif LANG == "c" and any(c in a for c in C_TEST_CMDS) and not any(v in a for v in VIEW_CMDS):
+        # C analog of "test passed": the build / reproducer ran clean
+        if returncode == 0 and "error" not in o and "failed" not in o \
+                and "sanitizer" not in o and "abort" not in o:
+            st["test_passed"] = True
 
 
 def is_key_step(action: str, st: dict) -> bool:
@@ -230,6 +242,10 @@ def is_key_step(action: str, st: dict) -> bool:
         if any(p in a for p in TEST_PATTERNS):
             if not any(v in a for v in VIEW_CMDS):
                 return True
+    if LANG == "c" and any(c in a for c in C_TEST_CMDS):
+        # C analog of "test execution (regardless of pass/fail)"
+        if not any(v in a for v in VIEW_CMDS):
+            return True
     if st.get("test_passed"):
         return True
     return False

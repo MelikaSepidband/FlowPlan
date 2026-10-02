@@ -13,6 +13,7 @@ grading via the official `secb patch|build|repro` in the vendor image.
 import argparse
 import json
 import os
+import subprocess
 from pathlib import Path
 
 import re
@@ -39,6 +40,37 @@ _DYN_NUDGE_TOOL = {"cfg": "crash_path", "dfg": "crash_path",
 # reach the Linux MCP server -> 0 gate denials, 0 MCP calls (the SecBench
 # adoption bug). SWE-Pro uses this same Linux binary.
 CLAUDE_BIN = str(Path.home() / ".local" / "bin" / "claude")
+
+
+# Related-work arms (2026 token-reduction methods) on SecBench, ported from
+# experiments/swebench_pro/run_experiment.py; each is the SecBench baseline
+# (no map, no --tools restriction, baseline prompt) plus the method's own
+# addition. SeeRepo is Python-only (AST graph) and is not ported.
+RW_ARMS = ("baseline_noexec", "baseline_agentdiet", "baseline_eetB",
+           "baseline_sherloc")
+# "To Run or Not to Run" (2606.26978) prohibited condition, C analog of their
+# sentence "Do not run pytest, unittest, or project test scripts. Project
+# dependencies are not installed." (the SecBench checkouts carry no build
+# dependencies either).
+SEC_NOEXEC_CLAUSE = ("Do not build the project, run its tests, or execute the "
+                     "proof-of-concept input. Build dependencies are not "
+                     "installed.")
+# SHERLOC's snapshot filter keeps only their DEFAULT_FILE_EXTENSIONS
+# ("py", "cfg"); on C/C++ repositories the sources must survive the filter.
+SEC_SHERLOC_EXTS = ("c", "h", "cc", "cpp", "cxx", "hh", "hpp", "hxx")
+
+
+def task_text(inst: dict) -> str:
+    """The SecBench task text the baseline prompt carries (build_prompt's
+    vulnerability + sanitizer-report sections), for the adapters that need
+    a 'problem statement' (SHERLOC's Problem Description, EET's retrieval)."""
+    return "\n".join([
+        "A real OSS-Fuzz vulnerability fires the `%s` sanitizer."
+        % (inst.get("sanitizer") or "?"),
+        "", "## Vulnerability", "",
+        (inst.get("bug_report") or inst.get("bug_description") or "")[:8000],
+        "", "## Sanitizer report", "",
+        (inst.get("sanitizer_report") or "")[:4000]])
 
 
 def is_baseline_dyn(cond: str) -> bool:
@@ -458,16 +490,42 @@ def harvest_patch(inst: dict, wt: Path) -> str:
     import subprocess
     exts = ("*.c", "*.cpp", "*.h", "*.hpp", "*.cc", "*.hh")
     subprocess.run(["git", "-C", str(wt), "add", "-A"], capture_output=True)
+    # BYTES, decoded with surrogateescape (2026-09-24): C sources often carry
+    # non-UTF-8 bytes (e.g. a Latin-1 'Ö' in a gpac copyright header). With
+    # text=True the diff decode raised UnicodeDecodeError -> the whole cell was
+    # recorded as cell_crash with no patch. surrogateescape round-trips the
+    # exact bytes as long as every writer uses the same error handler, so the
+    # graded patch is byte-identical to what the agent produced.
     r = subprocess.run(
         ["git", "-C", str(wt), "diff", "--no-color", "--cached", "HEAD", "--",
-         *exts], capture_output=True, text=True)
-    return r.stdout or ""
+         *exts], capture_output=True)
+    return (r.stdout or b"").decode("utf-8", errors="surrogateescape")
 
 
 def grade(inst: dict, patch: str, run_dir: Path) -> dict:
     """Grade via this repo's native SecBench grader (no external repo)."""
     from experiments.secbench import grade as sec_grade
     return sec_grade.grade_patch(inst, patch, run_dir)
+
+
+def _release_image_if_done(inst: dict, results_dir: Path, conditions) -> None:
+    """Remove the instance's grading image once EVERY condition of this run has
+    a grade.json for it. SecBench images are ~4 GB each and the 169-instance
+    sample would need ~670 GB cached; with instance-major cell order the image
+    is pulled once, used by all conditions, then dropped (2026-09-23). Best
+    effort: a failure here never touches the cell's verdict."""
+    try:
+        for c in conditions:
+            g = results_dir / ("%s__%s" % (inst["instance_id"], c)) / "grade.json"
+            if not (g.is_file() and g.stat().st_size > 0):
+                return
+        image = "%s:patch" % inst["image"]
+        subprocess.run(["docker", "rmi", "-f", image], capture_output=True,
+                       text=True, timeout=300)
+        print("[sec] released image %s (all %d conditions graded)"
+              % (image, len(conditions)))
+    except Exception as e:  # noqa: BLE001
+        print("[sec] image release skipped: %r" % (e,))
 
 
 def run_cell(inst: dict, condition: str, results_dir: Path, args) -> dict:
@@ -477,7 +535,27 @@ def run_cell(inst: dict, condition: str, results_dir: Path, args) -> dict:
         return {**json.loads((run_dir / "grade.json").read_text()),
                 "_skipped": True}
 
-    # TOKEN GUARD (same as swebench_pro/swtbench run_cell): a mid-batch OAuth
+    # REGRADE-ONLY path (2026-09-23): the agent already ran (result.json +
+    # model_patch.diff present) but grading failed for an infrastructure
+    # reason and its grade.json was removed. Grade the existing patch; never
+    # rerun the agent (the agent outcome is the datum).
+    rp, pp = run_dir / "result.json", run_dir / "model_patch.diff"
+    if (args.grade and rp.is_file() and rp.stat().st_size > 0 and pp.is_file()
+            and not args.force):
+        patch = pp.read_text(encoding="utf-8", errors="surrogateescape")
+        rec = {"instance_id": iid, "condition": condition,
+               "rep": condition_rep(condition), "patch_bytes": len(patch),
+               "regrade_only": True}
+        if not patch.strip():
+            g = {"resolved": False, "score": 0.0, "reason": "no_patch"}
+        else:
+            g = grade(inst, patch, run_dir)
+        rec.update(g)
+        (run_dir / "grade.json").write_text(json.dumps(rec, indent=2), "utf-8")
+        _release_image_if_done(inst, results_dir, args.conditions)
+        return rec
+
+    # TOKEN GUARD (same as swebench_pro run_cell): a mid-batch OAuth
     # expiry turns remaining cells into 1-turn 401 failures. Skip WITHOUT
     # artifacts so a post-re-login resume re-runs the cell cleanly. (SecBench
     # cells are expensive -- per-cell Joern server + CPG build -- so burning
@@ -606,6 +684,34 @@ def run_cell(inst: dict, condition: str, results_dir: Path, args) -> dict:
                           flow_first_tools=flow_first_tools,
                           flow_only_tool=flow_only_tool)
 
+    # Related-work arms ported from the SWE-bench Pro runner (rep None, no MCP
+    # map, the SecBench baseline prompt + the method's own addition; the CLI
+    # invocation is the SecBench baseline's). See RW_ARMS / task_text().
+    pre_stage_dir = None
+    if condition == "baseline_noexec":
+        # 2606.26978 prohibited-execution condition; their sentence names
+        # pytest/unittest, so the SecBench wording is our C analog (disclosed).
+        prompt = prompt + "\n\n" + SEC_NOEXEC_CLAUSE
+        (run_dir / "comparator_clause.txt").write_text(SEC_NOEXEC_CLAUSE, "utf-8")
+    elif condition == "baseline_sherloc":
+        from experiments.swebench_pro import sherloc_stage
+        block, _stage = sherloc_stage.run_stage(
+            inst, run_dir, wt, claude_bin=args.claude_bin, model=args.model,
+            effort=args.effort_flag, max_budget_usd=args.max_budget_usd,
+            timeout_sec=args.timeout_sec, problem_text=task_text(inst),
+            file_exts=SEC_SHERLOC_EXTS)
+        if block:
+            prompt = prompt + "\n\n" + block
+        pre_stage_dir = run_dir / "sherloc"
+    elif condition == "baseline_eetB":
+        from experiments.swebench_pro import eet_arm
+        block, _info = eet_arm.prepare(
+            {"instance_id": iid, "problem_statement": task_text(inst)},
+            run_dir, store="ours_sec169")
+        if block:
+            prompt = prompt + "\n\n" + block
+            gate_settings = swe_agent.write_eet_settings(run_dir, lang="c")
+
     # flow3: the v2 task body (no v2 flow steps -- flow_first_tools is None
     # for flow3 cells) wrapped by the v3 protocol: "/flowfix" + skill in the
     # per-run claude-home (default), or inlined per REPR_FLOW_SKILL=0.
@@ -632,7 +738,9 @@ def run_cell(inst: dict, condition: str, results_dir: Path, args) -> dict:
                 mcp_config=mcp_config,
                 restrict_tools=(mcp_config is not None),
                 settings_file=gate_settings, skill_md=flow3_skill_md,
-                sentinel=flow3_sentinel)
+                sentinel=flow3_sentinel,
+                agentdiet_proxy=(condition == "baseline_agentdiet"),
+                pre_stage_dir=pre_stage_dir)
         else:
             from experiments.common import codex_agent
             codex_agent.run_agent(
@@ -676,7 +784,7 @@ def run_cell(inst: dict, condition: str, results_dir: Path, args) -> dict:
     # the agent run; the perrep server (launched by claude) reads
     # JOERN_SERVER_URL from its mcp.json env. Without a CPG, run plainly.
     if cpg_path is not None:
-        from experiments.linuxflbench.joern_server import JoernServer
+        from experiments.common.joern_server import JoernServer
         srv = JoernServer(cpg_path, port=joern_port,
                           heap_gb=args.joern_heap_gb,
                           log_path=run_dir / "joern.server.log")
@@ -691,7 +799,8 @@ def run_cell(inst: dict, condition: str, results_dir: Path, args) -> dict:
         _run_the_agent()
 
     patch = harvest_patch(inst, wt)
-    (run_dir / "model_patch.diff").write_text(patch, encoding="utf-8")
+    (run_dir / "model_patch.diff").write_text(patch, encoding="utf-8",
+                                              errors="surrogateescape")
     rec = {"instance_id": iid, "condition": condition, "rep": rep,
            "patch_bytes": len(patch)}
     if args.grade:
@@ -701,6 +810,7 @@ def run_cell(inst: dict, condition: str, results_dir: Path, args) -> dict:
             g = grade(inst, patch, run_dir)
         rec.update(g)
         (run_dir / "grade.json").write_text(json.dumps(rec, indent=2), "utf-8")
+        _release_image_if_done(inst, results_dir, args.conditions)
     if not args.keep_checkouts:
         sec_checkout.cleanup_checkout(inst, suffix=condition)
     return rec
@@ -714,6 +824,8 @@ def main(argv=None):
     p.add_argument("--ids-file", default=None,
                    help="JSON file with a list of instance_ids")
     p.add_argument("--exp-name", default="secbench")
+    p.add_argument("--samples-dir", default=None,
+                   help="instance directory (default: samples/secbench_patch_n169)")
     p.add_argument("--concurrency", type=int, default=1)
     p.add_argument("--agent", choices=["claude", "codex"], default="claude")
     p.add_argument("--model", default=None)
@@ -746,7 +858,9 @@ def main(argv=None):
         a.model = ("gpt-5.4-mini" if a.agent == "codex"
                    else "claude-haiku-4-5")
 
-    allrows = sec_inst.load_all()
+    # --samples-dir: an alternative instance set (e.g. samples/secbench_eetbase_out169,
+    # the eval-split instances outside the 169 sample, used only as EET's base source)
+    allrows = sec_inst.load_all(Path(a.samples_dir)) if a.samples_dir else sec_inst.load_all()
     ids = a.instance_ids
     if a.ids_file:
         ids = json.loads(Path(a.ids_file).read_text(encoding="utf-8"))

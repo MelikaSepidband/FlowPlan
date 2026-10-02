@@ -167,16 +167,15 @@ def condition_flow_lean(condition: str) -> bool:
 
     PLAIN flow3 base plus REPR_FLOW_LEAN=1 server responses: (1) a hardened
     STOP in the flow_verify PASS note (post-verify tails: SWE 446K/cell in
-    88% of verify-reaching cells, 94% never touching the patch; SWT 145K;
+    88% of verify-reaching cells, 94% never touching the patch;
     Sec 47K) with an escape hatch for the measured 1-6% of tails that
     really edit, and (2) batch/one-plan nudges in flow_plan/flow_check
     next-fields (66% of SWE flow_checks follow zero edits ~70K/cell; Sec
-    2.07 plans/cell ~34K/cell; inert on SWT, 1.07 checks/cell). Response
+    2.07 plans/cell ~34K/cell). Response
     text ONLY -- no skill addendum, and NO bundled view (REPR_FLOW_BUNDLE
     stays off), so the stop rule is measured alone for the first time
     (every prior stop datapoint was joint bundle+stop). Same rep set as
-    flow3b. SWT/SecBench harness wiring deferred -- the server-side gate
-    is shared; those harnesses gain their env additions later."""
+    flow3b."""
     return (condition.endswith("_perrep_flow3L")
             and condition_rep(condition) in ("cfg", "dfg", "cfgdfg",
                                              "ast", "calls"))
@@ -456,7 +455,6 @@ def write_mcp_config(rep: str, worktree: Path, run_dir: Path,
                      flow_nofix: bool = False,
                      flow_of_only: bool = False,
                      flow_verify: bool = True,
-                     flow_testgen: bool = False,
                      flow_v3: bool = False,
                      flow_strict: bool = False,
                      flow_slice: bool = False,
@@ -465,8 +463,6 @@ def write_mcp_config(rep: str, worktree: Path, run_dir: Path,
                      flow_lean: bool = False,
                      flow_comply: bool = False,
                      flow_ripple: bool = False,
-                     flow_testrec: bool = False,
-                     flow_pathcond: bool = False,
                      flow_witness: bool = False,
                      run_dir_env: bool = False) -> Path:
     """The --mcp-config json launching our perrep server for <rep>."""
@@ -506,12 +502,6 @@ def write_mcp_config(rep: str, worktree: Path, run_dir: Path,
                     "REPR_FLOW_COMPLY": "1" if flow_comply else "",
                     # flow3rip: co-change candidates on verified changes.
                     "REPR_FLOW_RIPPLE": "1" if flow_ripple else "",
-                    # flow3t (SWT): per-delta plan-echo test recipes +
-                    # test-artifact lints. Off -> testgen byte-identical.
-                    "REPR_FLOW_TESTREC": "1" if flow_testrec else "",
-                    # flow3p (SWT, cfg-only): CFG reachability certificate
-                    # on each recipe. Off -> flow3t byte-identical.
-                    "REPR_FLOW_PATHCOND": "1" if flow_pathcond else "",
                     # flow3w: shadow-fix witness (buggy-vs-shadow runs,
                     # DFG sink diff on graph arms, raw dump on placebos).
                     "REPR_FLOW_WITNESS": "1" if flow_witness else "",
@@ -548,10 +538,6 @@ def write_mcp_config(rep: str, worktree: Path, run_dir: Path,
                     "REPR_FLOW_OF_ONLY": "1" if flow_of_only else "",
                     # LFLB passes flow_verify=False (localization, no edits).
                     "REPR_FLOW_VERIFY": "" if flow_verify else "0",
-                    # SWT (test-gen) mode: plan = the delta a FIX would make;
-                    # check/verify prove the SOURCE flow is untouched and the
-                    # diff is test-files-only.
-                    "REPR_FLOW_TESTGEN": "1" if flow_testgen else "",
                     # flow3 (v3) arm: v3 tool semantics (add_function op,
                     # fault_site, HEAD snapshots, merge-on-replan, graded
                     # verdicts, replace arg on flow_plan). Default off ->
@@ -976,7 +962,7 @@ def run_cell(inst: dict, condition: str, results_dir: Path, args) -> dict:
     # the tools active); kept behind --steer for ablations.
     sys_prompt_file = None
     if args.steer:
-        from experiments.swebench_pro import stee
+        from experiments.swebench_pro import steer
         sp = steer.system_prompt_for(condition, tools_active=restrict)
         if sp:
             sys_prompt_file = run_dir / "system_prompt.md"

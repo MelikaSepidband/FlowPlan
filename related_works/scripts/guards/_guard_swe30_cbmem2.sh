@@ -49,7 +49,7 @@ if [ "$LEFT" -lt 90 ]; then log "OAuth has $LEFT min -> NOT launching (re-login 
 # pgrep -f counts it, so the gate never opens (observed 19:07-19:47 with an
 # idle box). Match the python module invocation only, and drop our own pid,
 # our parent, and any pid whose cmdline is a shell running this guard.
-OTHER=$(pgrep -f "\-m experiments\.(swebench_pro|swtbench|secbench)\.run_experiment" \
+OTHER=$(pgrep -f "\-m experiments\.(swebench_pro|secbench)\.run_experiment" \
         | grep -v -x -e "$$" -e "$PPID" | wc -l)
 LOAD1=$(cut -d' ' -f1 /proc/loadavg | cut -d. -f1)
 HALF=$(( $(nproc) / 2 ))

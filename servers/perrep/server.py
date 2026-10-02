@@ -91,17 +91,9 @@ def create_server() -> ReprServer:
                        rep, fe.FLOW_OF_DESCRIPTION)
         server.tool(description=of_desc)(fe.flow_of)
         if not flow_of_only:
-            # TEST-GEN mode (SWT, REPR_FLOW_TESTGEN=1): same three tools,
-            # test-generation semantics -- the plan records the delta a FIX
-            # would make, and check/verify prove the SOURCE flow is untouched
-            # and the diff is test-files-only.
-            testgen = os.environ.get("REPR_FLOW_TESTGEN", "").strip() == "1"
-            plan_desc = (fe.TG_FLOW_PLAN_DESCRIPTION if testgen
-                         else fe.FLOW_PLAN_DESCRIPTION)
-            check_desc = (fe.TG_FLOW_CHECK_DESCRIPTION if testgen
-                          else fe.FLOW_CHECK_DESCRIPTION)
-            verify_desc = (fe.TG_FLOW_VERIFY_DESCRIPTION if testgen
-                           else fe.FLOW_VERIFY_DESCRIPTION)
+            plan_desc = fe.FLOW_PLAN_DESCRIPTION
+            check_desc = fe.FLOW_CHECK_DESCRIPTION
+            verify_desc = fe.FLOW_VERIFY_DESCRIPTION
             # flow3 (REPR_FLOW_V3=1): SAME tool name + description, but the
             # v3 callable, whose schema adds the optional ``replace`` arg
             # (v3 re-plans MERGE by function; replace=true starts over).

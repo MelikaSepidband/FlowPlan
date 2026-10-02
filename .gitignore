@@ -10,3 +10,9 @@ results/
 # related-work arms (pinned in related_works/README.md)
 workspace/
 third_party/
+tools/sherloc_src/
+tools/seerepo_src/
+tools/eet_src/
+tools/ContextSniper/
+tools/claude-code-cmv/
+tools/lingua_venv/

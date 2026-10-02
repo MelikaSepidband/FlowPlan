@@ -1,17 +1,13 @@
 """Tests for experiments.common.flow_protocol -- the flow3 (v3) protocol
 text, the flowfix skill wrapper, and the skill-vs-inline prompt modes.
 
-The module serves ONLY the new *_perrep_flow3 conditions; the v2 arms' text
-lives untouched in the three harnesses (parity guards for that live in
-tests/test_perrep_flow.py)."""
+The module serves ONLY the *_perrep_flow3 conditions (repair and security)."""
 
 import pytest
 
 from experiments.common import flow_protocol as fp
 
 ORDER_REPAIR = "Do NOT call flow_plan until you can see the bug in a graph"
-ORDER_TESTGEN = ("Do NOT call flow_plan until the faulty source function's "
-                 "graph is in view")
 
 
 def _steps(task, rep):
@@ -55,30 +51,24 @@ def test_build_steps_v3_elements_every_cell():
             for tool in fp.tool_names(rep):
                 assert tool in s, (task, rep, tool)
             assert "flow_locate" in s, (task, rep)
-            # step-0 ordering sentence, task-adapted
-            if task == "testgen":
-                assert ORDER_TESTGEN in s, rep
-                assert ORDER_REPAIR not in s, rep
-            else:
-                assert ORDER_REPAIR in s, (task, rep)
+            # step-0 ordering sentence
+            assert ORDER_REPAIR in s, (task, rep)
             # the Grep/Read localization fallback
             assert "IF THE BUG IS NOT IN THE FLOW" in s, (task, rep)
             assert "Grep" in s and "Read" in s, (task, rep)
 
 
 def test_step2_flow_locate_wording_per_task():
-    """Step 2 is the SEPARATE flow_locate call in all 9 combos, with
-    task-matched wording: repair = the faulty spot the graph shows; testgen
-    = the SOURCE-graph spot the test drives through (no repair words);
+    """Step 2 is the SEPARATE flow_locate call in all 6 combos, with
+    task-matched wording: repair = the faulty spot the graph shows;
     security = the crash-path spot that needs the guard. All inherit into
     flow_plan's fault_site, and step 3 stays the Grep/Read fallback."""
     for rep in fp.REPS:
         locate = "mcp__%s_perrep__flow_locate" % rep
         graph_word = "graphs" if rep == "cfgdfg" else "graph"
         r = _steps("repair", rep)
-        t = _steps("testgen", rep)
         s = _steps("security", rep)
-        for x in (r, t, s):
+        for x in (r, s):
             assert ("2. (REQUIRED) Call `%s`" % locate) in x, rep
             assert "inherit it as their fault_site" in x, rep
             assert "3. IF THE BUG IS NOT IN THE FLOW" in x, rep
@@ -87,40 +77,24 @@ def test_step2_flow_locate_wording_per_task():
             assert "7. (REQUIRED LAST)" in x, rep
         assert ("faulty spot the %s shows" % graph_word) in r, rep
         assert "why the flow is wrong there" in r, rep
-        assert ("spot in the SOURCE %s" % graph_word) in t, rep
-        assert "your test must drive through" in t, rep
-        # testgen step 2 carries no repair/security wording
-        assert "faulty spot the %s shows" % graph_word not in t, rep
-        assert "crash-path spot" not in t, rep
+        assert "crash-path spot" not in r, rep
         assert "crash-path spot that needs the guard" in s, rep
         assert "sanitizer frames" in s, rep
 
 
 def test_build_steps_task_wording_isolation():
-    """testgen must NOT get repair wording and vice versa; security keeps
-    the C guard/crash wording."""
+    """repair and security each keep their own wording: security has the C
+    guard/crash wording, repair does not."""
     for rep in fp.REPS:
         r = _steps("repair", rep)
-        t = _steps("testgen", rep)
         s = _steps("security", rep)
         # repair speaks of fixing by editing source
         assert "You fix this bug" in r
         assert "Make the SMALL code edit" in r
         assert "non-empty patch" in r
-        # ...none of which belongs in testgen
-        assert "You fix this bug" not in t
-        assert "Make the SMALL code edit" not in t
-        assert "non-empty patch" not in t
-        # testgen speaks of writing a failing test, touching no source
-        assert "Do NOT fix the bug" in t
-        assert "test really fails on the current code" in t
-        assert "ONLY" in t and "test files" in t
-        # ...none of which belongs in repair or security
-        assert "Do NOT fix the bug" not in r
-        assert "Do NOT fix the bug" not in s
-        # security keeps the vulnerability/guard wording, absent elsewhere
+        # security keeps the vulnerability/guard wording, absent in repair
         assert "vulnerability" in s and "crash" in s
-        assert "vulnerability" not in r and "vulnerability" not in t
+        assert "vulnerability" not in r
         assert "Make the SMALL C edit" in s
         assert "Make the SMALL C edit" not in r
 
@@ -159,9 +133,8 @@ def test_skill_md_frontmatter_and_sentinel():
     assert lines[5] == "## Work IN THE FLOW (there is no code map)"
     assert ORDER_REPAIR in md
     # per-task descriptions stay task-appropriate
-    md_t = fp.build_skill_md("testgen", "cfg", fp.tool_names("cfg"))
-    assert "test" in md_t.splitlines()[2]
-    assert ORDER_TESTGEN in md_t
+    md_s = fp.build_skill_md("security", "cfg", fp.tool_names("cfg"))
+    assert "security" in md_s.splitlines()[2]
 
 
 def test_sentinel_is_plain_rendered_line_not_html_comment():

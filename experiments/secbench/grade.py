@@ -58,7 +58,9 @@ def grade_patch(inst: dict[str, Any], patch: str, run_dir: Path,
     if not patch.strip():
         return {"resolved": False, "score": 0.0, "reason": "no_patch"}
     patch_path = run_dir / "model_patch.diff"
-    patch_path.write_text(patch, encoding="utf-8", newline="\n")
+    # surrogateescape: byte-exact round trip of non-UTF-8 source bytes (see
+    # harvest_patch in run_experiment.py)
+    patch_path.write_text(patch, encoding="utf-8", errors="surrogateescape", newline="\n")
 
     # Pull is best-effort: proceed if the image is already local.
     # errors="replace": a PoC/build step can emit non-UTF-8 bytes; without a

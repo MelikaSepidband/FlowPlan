@@ -25,6 +25,13 @@ from mcp.server.fastmcp import FastMCP
 from servers.sherloc_server._their import their_modules
 
 RepoManager, ToolExecutor, EXCLUDE_DIRS, FILE_EXTENSIONS = their_modules()
+# SecBench (C/C++): their DEFAULT_FILE_EXTENSIONS is ("py", "cfg") -- a config
+# default for their Python benchmarks, not part of the method. The stage passes
+# the C/C++ extensions through this env so their filter_repo_dict keeps the C
+# sources; every other knob stays at their default. Disclosed in the arm notes.
+if os.environ.get("SHERLOC_FILE_EXTENSIONS"):
+    FILE_EXTENSIONS = tuple(
+        x.strip() for x in os.environ["SHERLOC_FILE_EXTENSIONS"].split(",") if x.strip())
 
 SNAPSHOT = os.environ["SHERLOC_SNAPSHOT"]
 LOG_PATH = os.environ.get("SHERLOC_LOG")
@@ -86,6 +93,113 @@ def repo_tree() -> str:
     return _run({"tool": "repo_tree"})
 
 
+C_EXTS = (".c", ".h", ".cc", ".cpp", ".cxx", ".hh", ".hpp", ".hxx")
+
+
+def _repo_files(node, prefix=""):
+    """Flatten their nested snapshot dict into (relative path, lines)."""
+    out = []
+    for k, v in node.items():
+        if not isinstance(v, dict):
+            continue
+        p = "%s/%s" % (prefix, k) if prefix else k
+        if "text" in v:
+            out.append((p, v["text"]))
+        else:
+            out.extend(_repo_files(v, p))
+    return out
+
+
+def _c_connected_tree(repo: dict, target: Optional[str]) -> str:
+    """C/C++ analog of their connected_tree (which parses Python import
+    statements only, so on a C repository it returns nothing): the internal
+    `#include` graph. A quoted or angle include resolves to a repository file
+    by path relative to the includer, then by path suffix, then by unique
+    basename; system headers that resolve to nothing are dropped (their tool
+    likewise shows only internal dependencies). Output mirrors their per-file
+    layout (imports / imported-by, 10 per list) and their summary of the ten
+    most connected files. Same skip list of test/docs/build directories."""
+    import re
+    # their snapshot nests the tree under "structure" and their tools address
+    # files relative to it; the analog does the same
+    if isinstance(repo.get("structure"), dict):
+        repo = repo["structure"]
+    skip = {"test", "tests", "testing", "docs", "documentation", "build", "dist",
+            ".git", "third_party", "thirdparty", "external", "vendor"}
+    files = [(p, t) for p, t in _repo_files(repo)
+             if p.endswith(C_EXTS) and not (set(p.split("/")[:-1]) & skip)]
+    paths = [p for p, _ in files]
+    by_base = {}
+    for p in paths:
+        by_base.setdefault(p.rsplit("/", 1)[-1], []).append(p)
+    inc_re = re.compile(r'^\s*#\s*include\s*[<"]([^>"]+)[>"]')
+    deps = {p: set() for p in paths}
+    for p, lines in files:
+        d = p.rsplit("/", 1)[0] if "/" in p else ""
+        for line in lines:
+            m = inc_re.match(line)
+            if not m:
+                continue
+            inc = m.group(1).strip().replace("\\", "/")
+            cand = ("%s/%s" % (d, inc)) if d else inc
+            # normalise ../ segments
+            parts = []
+            for seg in cand.split("/"):
+                if seg == "..":
+                    if parts:
+                        parts.pop()
+                elif seg and seg != ".":
+                    parts.append(seg)
+            cand = "/".join(parts)
+            hit = None
+            if cand in deps:
+                hit = cand
+            else:
+                suf = [q for q in paths if q.endswith("/" + inc) or q == inc]
+                if len(suf) == 1:
+                    hit = suf[0]
+                elif not suf:
+                    b = by_base.get(inc.rsplit("/", 1)[-1], [])
+                    if len(b) == 1:
+                        hit = b[0]
+            if hit and hit != p:
+                deps[p].add(hit)
+    rdeps = {p: set() for p in paths}
+    for p, ds in deps.items():
+        for q in ds:
+            rdeps[q].add(p)
+    if target:
+        t = target.strip().lstrip("./")
+        if t not in deps:
+            suf = [q for q in paths if q.endswith("/" + t)]
+            if len(suf) == 1:
+                t = suf[0]
+            else:
+                return "ERROR: File '%s' not found in repository." % target
+        out = ["═══ %s ═══" % t]
+        d = sorted(deps[t])
+        out.append("→ INCLUDES (%d):" % len(d))
+        out += ["   • %s" % q for q in d[:10]]
+        if len(d) > 10:
+            out.append("   ... and %d more" % (len(d) - 10))
+        r = sorted(rdeps[t])
+        out.append("← INCLUDED BY (%d):" % len(r))
+        out += ["   • %s" % q for q in r[:10]]
+        if len(r) > 10:
+            out.append("   ... and %d more" % (len(r) - 10))
+        return "\n".join(out)
+    ranked = sorted(paths, key=lambda q: -(len(deps[q]) + len(rdeps[q])))[:10]
+    out = ["CONNECTED FILES OVERVIEW (C/C++ #include graph; %d source files, top 10 most connected):" % len(paths)]
+    for q in ranked:
+        out.append("  %s  → includes %d, ← included by %d" % (q, len(deps[q]), len(rdeps[q])))
+    return "\n".join(out)
+
+
+def _repo_has_python() -> bool:
+    root = REPO["structure"] if isinstance(REPO.get("structure"), dict) else REPO
+    return any(p.endswith(".py") for p, _ in _repo_files(root))
+
+
 @mcp.tool()
 def connected_tree(file: Optional[str] = None) -> str:
     """Shows import dependencies and relationships. If `file` is specified,
@@ -95,6 +209,20 @@ def connected_tree(file: Optional[str] = None) -> str:
     block = {"tool": "connected_tree"}
     if file:
         block["file"] = file
+    if not _repo_has_python():
+        # C/C++ repository (SecBench): their Python-import analysis has nothing
+        # to read; serve the #include analog, logged like every other call.
+        t0 = time.time()
+        out = _c_connected_tree(REPO, file)
+        if LOG_PATH:
+            try:
+                with open(LOG_PATH, "a", encoding="utf-8") as fh:
+                    fh.write(json.dumps({"ts": t0, "call": dict(block, analog="c_include"),
+                                         "chars": len(out), "est_tokens": len(out) // 4,
+                                         "ms": int((time.time() - t0) * 1000)}) + "\n")
+            except Exception:
+                pass
+        return out
     return _run(block)
 
 

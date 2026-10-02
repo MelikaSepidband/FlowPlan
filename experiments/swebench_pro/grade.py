@@ -14,6 +14,7 @@ swebench_pro adapter; kept self-contained so it runs from this repo.
 """
 
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -21,8 +22,11 @@ from pathlib import Path
 from typing import Any
 
 DOCKER_REGISTRY = "jefzda/sweap-images"
-OFFICIAL_HARNESS = Path(
-    "/home/tempadmin/code_rep_data/swebench_pro/official_harness")
+# Checkout of the official SWE-bench Pro harness (run_scripts/ + dockerfiles/),
+# overridable via env.
+OFFICIAL_HARNESS = Path(os.environ.get(
+    "SWEBENCH_PRO_HARNESS",
+    str(Path.home() / "code_rep_data" / "swebench_pro" / "official_harness")))
 
 
 def _strip_binary_hunks(diff: str) -> str:

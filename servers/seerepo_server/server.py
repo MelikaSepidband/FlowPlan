@@ -37,7 +37,8 @@ from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP, Image
 
-SRC = Path(os.environ.get("SEEREPO_SRC", "/home/tempadmin/Code_rep_mcp_tools/tools/seerepo_src/src"))
+SRC = Path(os.environ.get("SEEREPO_SRC",
+                          str(Path(__file__).resolve().parents[2] / "tools" / "seerepo_src" / "src")))
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 # Their package prints a banner + "Loading global config" via rich.Console()

@@ -15,15 +15,6 @@ def _rep() -> str:
     return r if r in ("dfg", "cfgdfg") else "cfg"
 
 
-def _testgen() -> bool:
-    """TEST-GENERATION mode (SWT): the deliverable is a TEST, not a fix.
-    flow_plan records the delta a correct FIX would make (the contract the
-    test asserts the absence of); flow_check/flow_verify then verify the
-    SOURCE flow is UNCHANGED (fixing the bug would defeat reproduction) and
-    that the diff touches ONLY test files."""
-    return os.environ.get("REPR_FLOW_TESTGEN", "").strip() == "1"
-
-
 FLOW_PLAN_DESCRIPTION = (
     "Commit to the GRAPH-LEVEL change you intend BEFORE editing code. Given the "
     "bug report and the function you will fix, state the delta the fix makes to "
@@ -53,51 +44,6 @@ FLOW_CHECK_DESCRIPTION = (
     "did not make the graph change you intended -- reconsider the edit. "
     "'no_flow_change' planned AND observed also matches. Example: "
     "flow_check(function='wrap_var')."
-)
-
-
-# --- TEST-GENERATION (SWT) mode descriptions ---------------------------------
-#
-# Same three tools, test-gen semantics: the plan is the delta a correct FIX
-# would make (what the test asserts is MISSING), and verification proves the
-# agent did NOT alter the source flow and delivered only test files.
-
-TG_FLOW_PLAN_DESCRIPTION = (
-    "REQUIRED before writing your test. Record the flow delta a correct FIX "
-    "would make to the buggy function, as a list of {op, function, anchor, "
-    "rationale} (control flow: add_guard, remove_branch, change_condition, "
-    "change_block_structure, rewire_edge; data flow: add_def_use, "
-    "remove_def_use, move_def_use; or no_flow_change). This is the CONTRACT "
-    "your test checks: the test must FAIL on the current code BECAUSE that "
-    "delta is absent, and PASS once a fix realizes it. Design the test to "
-    "drive execution through exactly that flow locus. This also snapshots "
-    "the source function's current graph so flow_check/flow_verify can "
-    "confirm you did not alter the source. Call it ONCE, before writing the "
-    "test. Example: flow_plan(deltas=[{'op':'add_guard', "
-    "'function':'wrap_var', 'anchor':'utils/vars.py:88', 'rationale':'a fix "
-    "would guard None before merge; my test passes None and expects the "
-    "guarded behavior'}])."
-)
-
-TG_FLOW_CHECK_DESCRIPTION = (
-    "Confirm the SOURCE function's flow graph is UNCHANGED (pass the "
-    "function name). You must NOT fix or alter the bug -- your test has to "
-    "FAIL on the CURRENT code; a 'fixed' source would make it pass and "
-    "defeat reproduction. match=true means the source flow is untouched, as "
-    "required. match=false means your edits changed the source function's "
-    "flow -- revert them; deliver ONLY a test. Example: "
-    "flow_check(function='wrap_var')."
-)
-
-TG_FLOW_VERIFY_DESCRIPTION = (
-    "FINAL STEP -- call ONCE, with no arguments, when your test is written "
-    "and BEFORE you stop. Verifies the whole deliverable: (1) EVERY planned "
-    "source function's flow graph is UNCHANGED (you did not fix/alter the "
-    "bug -- the test must fail on the current code), (2) your diff touches "
-    "ONLY test files (any non-test source edit is a violation -- revert "
-    "it), and (3) lists the test files you added/changed. If it reports a "
-    "source-flow change or a non-test edit, fix that and call flow_verify "
-    "once more."
 )
 
 
@@ -543,10 +489,6 @@ def _flow_plan_impl(deltas: list, replace: bool) -> list:
         "snapshotted_functions": sorted(snapshots),
         "warnings": problems,
         "next": (
-            "Now write the TEST that drives execution through this planned "
-            "flow locus so it FAILS on the current code (do NOT edit source "
-            "files), then call flow_verify before you stop."
-            if _testgen() else
             "Now make the code edit that realizes this plan, then call "
             "flow_check on each function you edited."),
     }
@@ -827,113 +769,7 @@ def flow_check(function: str) -> list:
                      "functions: %s"
                      % [d["function"] for d in plan.get("deltas", [])]},
             "unknown")]
-    if _testgen():
-        if flowedit.flow_v3() and planned.get("op") == "add_function":
-            return [_testgen_check_add_function(planned, func)]
-        return [_check_source_untouched(rep, plan, planned, func)]
     return [_verify_delta(rep, plan, planned, func)]
-
-
-def _check_source_untouched(rep: str, plan: dict, planned: dict,
-                            func: str) -> dict:
-    """TEST-GEN verification: the planned SOURCE function's graph(s) must be
-    UNCHANGED -- the test must fail on the current code, so 'fixing' the bug
-    defeats the task. Handles both single-rep (str snapshot) and combined
-    (dict {'cfg':..,'dfg':..}) snapshot shapes."""
-    snap = plan.get("snapshots", {}).get(planned["function"])
-    anchor = str(planned.get("anchor", "")).strip()
-    if isinstance(snap, dict):
-        pairs = sorted(snap.items())
-    elif isinstance(snap, str):
-        pairs = [(plan.get("rep") or rep, snap)]
-    else:
-        pairs = []
-    if not pairs:
-        return _v3_verdict(
-            {"function": func, "planned_op": planned["op"], "match": None,
-             "note": "no pre-plan snapshot for this function (was the "
-                     "name resolvable at flow_plan time?)"}, "unknown")
-    changed = []
-    for sub, before_repr in pairs:
-        sub = "cfg" if sub not in ("cfg", "dfg") else sub
-        # anchor scopes resolution under v3 (fix 2a); inert for v2 arms.
-        after = flowedit.func_fingerprint_now(sub, func, anchor=anchor)
-        if after is None and anchor and anchor != func:
-            after = flowedit.func_fingerprint_now(sub, anchor)
-        if after is None:
-            continue
-        if flowedit.flow_v3():
-            # fix A, testgen side: structural (object) comparison. The SWT
-            # flow3 harness re-runs this check CROSS-PROCESS (record_final_
-            # verify -> flow_verify_cli), where a different hash seed
-            # reorders the dfg frozenset repr -- a repr-string compare
-            # false-reported source_flow_changed on an UNTOUCHED source
-            # function; see _verify_delta. v2 keeps the repr-string compare
-            # byte-identical (v2 SWT cells never run the harness-side CLI).
-            before = _eval_fp(before_repr)
-            if before is None:
-                return _v3_verdict(
-                    {"function": func, "planned_op": planned["op"],
-                     "match": None,
-                     "note": "corrupt pre-edit snapshot"}, "unknown")
-            if flowedit.fp_shape_mismatch(before, after):
-                return _mixed_fp_unknown(func, planned["op"], graph=sub)
-            if before != after:
-                changed.append(sub)
-        elif repr(after) != before_repr:
-            changed.append(sub)
-    if changed:
-        return _v3_verdict(
-            {"function": func, "planned_op": planned["op"],
-             "observed": "source_flow_changed", "match": False,
-             "note": "the SOURCE function's %s graph CHANGED -- you must "
-                     "NOT fix or alter the bug; your test must FAIL on "
-                     "the CURRENT code. Revert your source edits and "
-                     "deliver ONLY a test." % "+".join(changed)}, "mismatch")
-    return _v3_verdict(
-        {"function": func, "planned_op": planned["op"],
-         "observed": "source_flow_unchanged", "match": True,
-         "note": "source flow unchanged, as required. Your planned %s is "
-                 "the delta a FIX would make -- your test should FAIL "
-                 "now because that change is absent, and PASS once a fix "
-                 "makes it." % planned["op"]}, "exact")
-
-
-def _testgen_check_add_function(planned: dict, func: str) -> dict:
-    """TEST-GEN + v3 add_function: the plan says a FIX would ADD this
-    function; the agent must NOT add it -- verify it still does not exist
-    in the current source (index-bypassing, by name)."""
-    rel, name = _addfn_locate(planned)
-    if rel is None or name is None:
-        return _v3_verdict(
-            {"function": func, "planned_op": "add_function", "match": None,
-             "note": "cannot locate the planned new function (need a "
-                     "file:line anchor plus the function NAME)"}, "unknown")
-    text = _read_rel(rel)
-    if text is None:
-        return _v3_verdict(
-            {"function": func, "planned_op": "add_function",
-             "observed": "source_flow_unchanged", "match": True,
-             "note": "the file a fix would create does not exist -- the "
-                     "function a fix would ADD is still absent, as "
-                     "required; your test should FAIL now for that "
-                     "reason."}, "exact")
-    from servers.common import joern_cfg
-    src = flowedit.func_source_by_name(text, name, joern_cfg.is_c_file(rel))
-    if src is not None:
-        return _v3_verdict(
-            {"function": func, "planned_op": "add_function",
-             "observed": "source_flow_changed", "match": False,
-             "note": "you ADDED function %r -- that is the FIX's job, not "
-                     "the test's; your test must FAIL on the CURRENT code. "
-                     "Revert the source edit and deliver ONLY a test."
-                     % name}, "mismatch")
-    return _v3_verdict(
-        {"function": func, "planned_op": "add_function",
-         "observed": "source_flow_unchanged", "match": True,
-         "note": "the function a fix would ADD is still absent, as "
-                 "required -- your test should FAIL now for that reason."},
-        "exact")
 
 
 def _verify_delta(rep: str, plan: dict, planned: dict, func: str) -> dict:
@@ -1168,67 +1004,6 @@ def _verify_add_function(plan: dict, planned: dict, func: str) -> dict:
                  "op." % (name, observed)}, "mismatch")
 
 
-def _flow_verify_testgen(rep: str, plan: dict, deltas: list) -> dict:
-    """TEST-GEN final verification: (1) every planned SOURCE function's flow
-    unchanged, (2) the diff touches ONLY test files, (3) a test edit exists."""
-    results = [
-        (_testgen_check_add_function(d, d["function"])
-         if flowedit.flow_v3() and d.get("op") == "add_function"
-         else _check_source_untouched(rep, plan, d, d["function"]))
-        for d in deltas]
-    try:
-        # empty plan on purpose: in test-gen NOTHING outside test files may
-        # change -- including the planned functions' own files (the plan
-        # names what a FIX would touch, not what the AGENT may touch), so no
-        # edit is filtered as "planned".
-        edits = flowedit.unplanned_edits({"deltas": []})
-    except Exception:
-        edits = []
-    violations = [e for e in edits if not flowedit.is_test_path(e["file"])]
-    test_edits = [e for e in edits if flowedit.is_test_path(e["file"])]
-    n_changed = sum(1 for r in results if r.get("match") is False)
-    n_unknown = sum(1 for r in results if r.get("match") is None)
-    ok = (n_changed == 0 and not violations and bool(test_edits))
-    if ok:
-        note = ("FINAL VERIFICATION PASSED: every planned source function's "
-                "flow is unchanged and your diff touches only test files "
-                "(%d test edit(s)). Make sure the test actually FAILS on "
-                "the current code for the planned reason, then stop."
-                % len(test_edits))
-    else:
-        probs = []
-        if n_changed:
-            probs.append("%d planned SOURCE function(s) have a CHANGED flow "
-                         "graph -- you must not fix/alter the bug; revert "
-                         "those source edits" % n_changed)
-        if violations:
-            probs.append("%d NON-TEST file edit(s) in the diff (%s) -- a "
-                         "test-generation deliverable may only touch test "
-                         "files; revert them"
-                         % (len(violations),
-                            ", ".join(sorted({v["file"]
-                                              for v in violations})[:5])))
-        if not test_edits:
-            probs.append("no test-file edit found yet -- write your "
-                         "reproducing test in the project's test suite")
-        if n_unknown:
-            probs.append("%d planned function(s) could not be checked (see "
-                         "their notes)" % n_unknown)
-        note = ("FINAL VERIFICATION ISSUES: " + "; ".join(probs)
-                + ". Address these, then call flow_verify once more.")
-    return {
-        "planned_deltas": len(deltas),
-        "results": results,
-        "source_flow_untouched": n_changed == 0,
-        "non_test_edits": violations,
-        "test_edits": test_edits,
-        # report-compat aliases: "unplanned" in test-gen = the violations
-        "unplanned_edits": violations,
-        "all_planned_match": ok,
-        "note": note,
-    }
-
-
 def _verify_delta_combined(plan: dict, planned: dict, func: str) -> dict:
     """Combined-arm (cfgdfg) verification: each delta checks against ITS
     graph (rep_for_op); no_flow_change means NEITHER graph changed. Snapshots
@@ -1369,8 +1144,6 @@ def flow_verify() -> list:
              "note": "the recorded flow_plan has no deltas -- re-plan "
                      "with flow_plan, then call flow_verify again."},
             "unknown")]
-    if _testgen():
-        return [_flow_verify_testgen(rep, plan, deltas)]
     results = [_verify_delta(rep, plan, d, d["function"]) for d in deltas]
     try:
         unplanned = flowedit.unplanned_edits(plan)

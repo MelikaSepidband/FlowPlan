@@ -28,6 +28,12 @@ def _run(cmd, cwd=None, check=False, timeout=1800):
                           text=True, timeout=timeout)
 
 
+# dataset `repo` -> current GitHub clone URL, for projects that moved (2026-09-19)
+REPO_URL_OVERRIDES = {
+    "matio/matio": "https://github.com/tbeu/matio.git",
+}
+
+
 def _safe(name: str) -> str:
     import re
     return re.sub(r"[^A-Za-z0-9_.-]+", "__", (name or "").strip())[:120] or "x"
@@ -56,7 +62,12 @@ def ensure_mirror(inst: dict[str, Any]) -> Path:
         tmp = mirror.parent / (mirror.name + ".tmp")
         if tmp.exists():
             shutil.rmtree(tmp, ignore_errors=True)
-        _run(["git", "clone", "--mirror", inst["repo_url"], str(tmp)],
+        # Upstream repositories that moved since the dataset was built: the
+        # dataset's `repo` field no longer resolves on GitHub (clone rc=128),
+        # which is why the 3 matio instances were missing from the earlier
+        # 166-id list. Same code, same base commits; only the clone URL differs.
+        url = REPO_URL_OVERRIDES.get(inst.get("repo", ""), inst["repo_url"])
+        _run(["git", "clone", "--mirror", url, str(tmp)],
              check=True, timeout=1800)
         tmp.rename(mirror)
         return mirror

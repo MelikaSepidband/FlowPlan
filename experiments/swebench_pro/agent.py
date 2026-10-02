@@ -406,13 +406,20 @@ def write_turn_reminder_settings(run_dir: Path, cap: int) -> Path:
     return p
 
 
-def write_eet_settings(run_dir: Path) -> Path:
+def write_eet_settings(run_dir: Path, lang: Optional[str] = None) -> Path:
     """settings.json for EET lever B (ACL'26 Findings, arXiv 2601.05777): a
     PostToolUse hook reproducing their ExperienceRetrievalAgent key-step
     detection, <confidence_check> request and >=81 <submission_prompt>.
     Only written for cells where their retrieval fired -- their own coupling
-    (no experience -> plain DefaultAgent, no confidence checks)."""
-    cmd = _hook_cmd({"EET_RUN_DIR": str(run_dir), "EET_ENABLED": "1"}, EET_HOOK)
+    (no experience -> plain DefaultAgent, no confidence checks).
+    lang="c" (SecBench): the hook's key-step detector, which their code keys on
+    pytest / python test scripts, also recognises the C/C++ build-and-run
+    commands (make, cmake, ctest, configure, fuzzer / PoC runs) -- see
+    eet_hook.py C_TEST_CMDS. Disclosed adaptation; everything else unchanged."""
+    env = {"EET_RUN_DIR": str(run_dir), "EET_ENABLED": "1"}
+    if lang:
+        env["EET_LANG"] = lang
+    cmd = _hook_cmd(env, EET_HOOK)
     settings = {
         "hooks": {
             "PostToolUse": [
@@ -1171,7 +1178,12 @@ def _turn_extension_stage(run_dir, cmd, env, wt, inst, rc, cap, extension,
 
 
 AGENTDIET_PROXY = STUDY_ROOT / "tools" / "agentdiet_proxy.py"
+# Interpreter of the request proxies (aiohttp, httpx, tiktoken): a dedicated
+# venv at tools/lingua_venv when present, otherwise the repo venv, whose
+# pinned dependencies include the same packages.
 LINGUA_VENV_PYTHON = STUDY_ROOT / "tools" / "lingua_venv" / "bin" / "python"
+if not LINGUA_VENV_PYTHON.is_file():
+    LINGUA_VENV_PYTHON = VENV_PYTHON
 
 
 def _start_agentdiet_proxy(run_dir: Path, claude_bin: str, model: str,
@@ -1390,7 +1402,7 @@ def run_agent(inst: dict[str, Any], run_dir: Path, *, claude_bin: str,
     run_dir = Path(run_dir).resolve()
     run_dir.mkdir(parents=True, exist_ok=True)
     wt = Path(worktree) if worktree is not None else checkout.prepare_worktree(inst)
-    # prompt_override lets a different task (e.g. SWT-bench test generation)
+    # prompt_override lets a different task (e.g. SecBench security patching)
     # supply its own user prompt while reusing all the agent-invocation
     # machinery. When None, build the default bug-fix prompt.
     prompt = prompt_override if prompt_override is not None else build_prompt(

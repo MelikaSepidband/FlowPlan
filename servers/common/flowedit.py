@@ -1475,16 +1475,6 @@ def _delta_matches_function(delta: dict, name: str, rel: str,
     return False
 
 
-def is_test_path(rel: str) -> bool:
-    """Same test-file heuristic the SWT harness uses to harvest the test diff
-    (dir names test/tests/testing, test_*.py / *_test.py, conftest.py)."""
-    q = "/" + str(rel).replace("\\", "/")
-    base = q.rsplit("/", 1)[-1]
-    return (any(h in q for h in ("/test/", "/tests/", "/testing/"))
-            or base.startswith("test_") or base.endswith("_test.py")
-            or base == "conftest.py")
-
-
 def unplanned_edits(plan: dict, max_items: int = 20) -> list:
     """Source edits (vs git HEAD) in functions the plan never mentioned.
 

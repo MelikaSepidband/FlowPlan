@@ -80,7 +80,15 @@ def run_agent(inst, run_dir: Path, *, claude_bin, worktree: Path, model,
               mcp_config: Optional[Path], restrict_tools: bool,
               settings_file: Optional[Path],
               skill_md: Optional[str] = None,
-              sentinel: Optional[str] = None) -> dict:
+              sentinel: Optional[str] = None,
+              agentdiet_proxy: bool = False,
+              pre_stage_dir: Optional[Path] = None) -> dict:
+    """agentdiet_proxy / pre_stage_dir: the related-work arms ported from the
+    SWE-bench Pro runner (baseline_agentdiet: their trajectory reduction as a
+    per-cell proxy; baseline_sherloc: fold the localization pre-stage's usage
+    into result.json). Both reuse the SWE-Pro helpers unchanged so the
+    accounting is identical across benchmarks; the CLI invocation stays the
+    SecBench baseline's."""
     run_dir = Path(run_dir).resolve()
     run_dir.mkdir(parents=True, exist_ok=True)
     (run_dir / "prompt.md").write_text(prompt, encoding="utf-8")
@@ -104,6 +112,10 @@ def run_agent(inst, run_dir: Path, *, claude_bin, worktree: Path, model,
     ub.mkdir(parents=True, exist_ok=True)
     env["PYTHONUSERBASE"] = str(ub)
     env["PIP_USER"] = "0"
+    agentdiet = None
+    if agentdiet_proxy:
+        agentdiet = swe_agent._start_agentdiet_proxy(run_dir, claude_bin, model, effort)
+        env["ANTHROPIC_BASE_URL"] = agentdiet[1]
 
     cmd = _build_cmd(claude_bin, prompt, model, effort, max_turns,
                      max_budget_usd, mcp_config, restrict_tools, settings_file)
@@ -147,6 +159,16 @@ def run_agent(inst, run_dir: Path, *, claude_bin, worktree: Path, model,
     if mined["result"] is not None:
         (run_dir / "result.json").write_text(
             json.dumps(mined["result"]), encoding="utf-8")
+    if pre_stage_dir is not None:
+        # baseline_sherloc: the localization session is part of the cell
+        swe_agent._merge_pre_stage(run_dir, Path(pre_stage_dir),
+                                   Path(pre_stage_dir).name)
+    if agentdiet is not None:
+        # baseline_agentdiet: stop the per-cell proxy (writes
+        # agentdiet_summary.json) and fold its reflection calls' usage in
+        swe_agent._stop_agentdiet_proxy(*agentdiet)
+        swe_agent._merge_side_calls(run_dir, run_dir / "agentdiet_reflections.jsonl",
+                                    "agentdiet")
     summary = {"instance_id": inst["instance_id"], "returncode": rc,
                "timed_out": timed_out, "wall_s": round(time.time() - started, 1),
                "n_tool_calls": len(mined["tools"]),

@@ -1,7 +1,7 @@
 """v3 ("flow3") protocol text + flowfix skill delivery for the flow arms.
 
-Used ONLY by the NEW *_perrep_flow3 conditions (cfg/dfg/cfgdfg x SWE-Pro
-repair / SWT test-gen / SecBench security). HARD RULE: v3 is a new arm,
+Used ONLY by the *_perrep_flow3 conditions (cfg/dfg/cfgdfg x SWE-bench
+repair / SecBench security). HARD RULE: v3 is a new arm,
 never a rewrite -- the v2 conditions' prompt text lives untouched in the
 three harnesses; this module owns all v3 prompt/skill text.
 
@@ -17,10 +17,9 @@ protocol:
               the flow is wrong (file:line + one-sentence reason) BEFORE
               planning; flow_plan inherits it as each delta's fault_site.
   flow_plan   every delta carries a ``fault_site`` (file:line of the faulty
-              spot; testgen: the SOURCE spot the new test must drive
-              execution through), inherited from flow_locate when absent;
+              spot), inherited from flow_locate when absent;
               v3 ops add ``add_function``.
-  edit        the smallest change (testgen: write the test, touch NO source).
+  edit        the smallest change.
   flow_check  at most ONE re-check on mismatch (no retry loops).
   flow_verify REQUIRED LAST; on failure fix and call once more.
 
@@ -52,7 +51,7 @@ SENTINEL = "FLOWFIX-PROTOCOL-V3"
 # The rendered first body line of SKILL.md. Distinctive enough not to occur in
 # normal prose or a task body, and it contains SENTINEL as a stable substring.
 SENTINEL_LINE = "FLOWFIX-PROTOCOL-V3 (flow-graph-first editing skill active)."
-TASKS = ("repair", "testgen", "security")
+TASKS = ("repair", "security")
 REPS = ("cfg", "dfg", "cfgdfg")
 
 _FLOW_TOOLS = ("flow_of", "flow_locate", "flow_plan", "flow_check",
@@ -80,8 +79,8 @@ def _validate(task: str, rep: str) -> None:
 
 # -- per-(task, rep) wording ---------------------------------------------------
 #
-# Kept deliberately close to the v2 prompts of the three harnesses (SWE-Pro
-# agent.build_prompt / swtbench prompt._flow_steps / secbench build_prompt) so
+# Kept deliberately close to the v2 prompts of the two harnesses (SWE-Pro
+# agent.build_prompt / secbench build_prompt) so
 # a v3-vs-v2 comparison isolates the PROTOCOL changes, not wording drift.
 # Dispatch is on the EXACT rep string, with "cfgdfg" its own key -- never on
 # substring matching ("dfg_perrep" is a substring of "cfgdfg_perrep").
@@ -104,20 +103,6 @@ _INTRO = {
         "reading the whole repo. Do NOT try to rewrite the whole function: "
         "find the ONE wrong element in whichever graph shows it, and change "
         "only that.",
-    ("testgen", "cfg"):
-        "To design a test that reproduces this bug, study the buggy "
-        "function's CONTROL-FLOW GRAPH -- the branches and paths where the "
-        "bug manifests -- not the whole repo.",
-    ("testgen", "dfg"):
-        "To design a test that reproduces this bug, study the buggy "
-        "function's VALUE-FLOW (def-use) GRAPH -- where values are defined "
-        "and used, so you can drive the wrong value into the faulty use -- "
-        "not the whole repo.",
-    ("testgen", "cfgdfg"):
-        "To design a test that reproduces this bug, study the buggy "
-        "function's TWO flow graphs -- its CONTROL-FLOW GRAPH (the branches "
-        "and paths where the bug manifests) and its VALUE-FLOW (def-use) "
-        "GRAPH (where values are defined and used) -- not the whole repo.",
     ("security", "cfg"):
         "Fix this vulnerability by working in the crashing function's "
         "CONTROL-FLOW GRAPH, not by reading the whole repo. Find the ONE "
@@ -166,18 +151,6 @@ _LOCATE = {
         "that should exist but doesn't (add it), a wrong condition (change "
         "it), a value used without being checked/derived first (add the def "
         "or guard), or a use reading a stale/wrong definition (repoint it).",
-    ("testgen", "cfg"):
-        "Read the flow to find the path/branch that misbehaves -- the input "
-        "or state that drives execution down the faulty edge; your test "
-        "must exercise THAT path.",
-    ("testgen", "dfg"):
-        "Read the flow to find the def/use relation the bug turns on -- the "
-        "input or state that makes a use read the wrong value; your test "
-        "must set up THAT value.",
-    ("testgen", "cfgdfg"):
-        "Read the two graphs together to find what the bug turns on -- the "
-        "path/branch that misbehaves and the value that drives execution "
-        "down it.",
     ("security", "cfg"):
         "Read the flow to locate the fix: most C security fixes ADD A GUARD "
         "-- a bounds/null/overflow check (an `if (...) return/break/goto`) "
@@ -215,9 +188,6 @@ _DESCRIPTION = {
     # a colon-space -- it would break the frontmatter parse).
     "repair": "Flow-graph-first bug fixing -- get the bug in a graph, plan "
               "the flow delta with its fault site, edit small, verify last.",
-    "testgen": "Flow-graph-first reproducing-test writing -- source graph "
-               "in view, plan the fix delta, write the failing test, verify "
-               "the source is untouched.",
     "security": "Flow-graph-first security patching -- crashing function's "
                 "graph in view, plan the guard, edit small, verify last.",
 }
@@ -248,30 +218,16 @@ def build_steps(task: str, rep: str, tools) -> str:
              "vulnerability description" if task == "security"
              else "the function/symbol names the bug report mentions")
 
-    if task == "testgen":
-        step0 = ("0. ORDER OF WORK -- localize first, plan second: get the "
-                 "faulty SOURCE function's graph in view and find where the "
-                 "bug lives in it BEFORE planning. Do NOT call flow_plan "
-                 "until the faulty source function's graph is in view.")
-    else:
-        step0 = ("0. ORDER OF WORK -- localize first, plan second: see the "
-                 "graph, find the bug IN the graph, and only then commit a "
-                 "plan. Do NOT call flow_plan until you can see the bug in "
-                 "a graph.")
+    step0 = ("0. ORDER OF WORK -- localize first, plan second: see the "
+             "graph, find the bug IN the graph, and only then commit a "
+             "plan. Do NOT call flow_plan until you can see the bug in "
+             "a graph.")
 
     step1 = ("1. (REQUIRED FIRST) Call `%s` with %s. %s There is no "
              "explore/map tool; %s." % (of, named, blurb, surface))
 
     graph_word = "graphs" if both else "graph"
-    if task == "testgen":
-        step2 = ("2. (REQUIRED) Call `%s` with the spot in the SOURCE %s "
-                 "whose behavior your test must drive through "
-                 "(site='file.py:LINE') and one sentence on why that spot "
-                 "is where the bug shows (reason=...). It validates the "
-                 "spot against the source %s and records it; your "
-                 "flow_plan deltas inherit it as their fault_site unless a "
-                 "delta gives its own." % (locate, graph_word, graph_word))
-    elif task == "security":
+    if task == "security":
         step2 = ("2. (REQUIRED) Call `%s` with the crash-path spot that "
                  "needs the guard -- the file:line the %s and the "
                  "sanitizer frames point at -- and one sentence on why the "
@@ -287,17 +243,7 @@ def build_steps(task: str, rep: str, tools) -> str:
                  "deltas inherit it as their fault_site unless a delta "
                  "gives its own." % (locate, graph_word, graph_word))
 
-    if task == "testgen":
-        step3 = ("3. IF THE BUG IS NOT IN THE FLOW, LOCALIZE FIRST: the "
-                 "report may name no function, a name may not resolve, or "
-                 "the graphs you got back may not contain the faulty "
-                 "region. Do NOT design the test off a flow that does not "
-                 "show the bug. Fall back to your own tools -- Grep for the "
-                 "error message / suspect identifiers, Read the candidate "
-                 "files -- until you find the faulty function, then call "
-                 "`%s` on THAT function and work from %s."
-                 % (of, "its flows" if both else "its flow"))
-    elif task == "security":
+    if task == "security":
         step3 = ("3. IF THE BUG IS NOT IN THE FLOW, LOCALIZE FIRST: the "
                  "report may not name the faulty function, a name may not "
                  "resolve, or the graphs you got back may not contain the "
@@ -317,38 +263,18 @@ def build_steps(task: str, rep: str, tools) -> str:
                  "files -- until you find the faulty function, then call "
                  "`%s` on THAT function and work %s." % (of, in_flow))
 
-    if task == "testgen":
-        step4 = ("4. (REQUIRED) %s Then call `%s` to record the flow delta "
-                 "a correct FIX would make (%s; plus function + anchor + "
-                 "rationale). That delta is the CONTRACT your test checks: "
-                 "the test must FAIL on the current code BECAUSE the change "
-                 "is absent, and PASS once a fix makes it. This also "
-                 "snapshots the source graphs so your work can be verified. "
-                 "In EVERY delta include `fault_site` -- the file:line of "
-                 "the spot in the SOURCE graph your new test must drive "
-                 "execution through (a delta without one inherits the spot "
-                 "you declared with `flow_locate`); for a no_flow_change "
-                 "delta still give the file:line plus a one-line reason."
-                 % (_LOCATE[(task, rep)], plan, _OPS[rep]))
-    else:
-        step4 = ("4. %s Then call `%s` to record the change (%s; plus "
-                 "function + anchor + rationale). Plan EVERY function you "
-                 "intend to touch in this ONE call; if you later revise the "
-                 "plan, calling `%s` again replaces only the deltas of the "
-                 "functions you re-plan. In EVERY delta include `fault_site`"
-                 " -- the file:line of the exact faulty spot the graph "
-                 "shows (a delta without one inherits the spot you declared "
-                 "with `flow_locate`); for a no_flow_change delta still "
-                 "give the file:line plus a one-line reason why no flow "
-                 "changes." % (_LOCATE[(task, rep)], plan, _OPS[rep], plan))
+    step4 = ("4. %s Then call `%s` to record the change (%s; plus "
+             "function + anchor + rationale). Plan EVERY function you "
+             "intend to touch in this ONE call; if you later revise the "
+             "plan, calling `%s` again replaces only the deltas of the "
+             "functions you re-plan. In EVERY delta include `fault_site`"
+             " -- the file:line of the exact faulty spot the graph "
+             "shows (a delta without one inherits the spot you declared "
+             "with `flow_locate`); for a no_flow_change delta still "
+             "give the file:line plus a one-line reason why no flow "
+             "changes." % (_LOCATE[(task, rep)], plan, _OPS[rep], plan))
 
-    if task == "testgen":
-        step5 = ("5. Write the test in the project's test suite so it "
-                 "drives execution through exactly that flow locus and "
-                 "asserts the CORRECT (currently-violated) behavior. Touch "
-                 "NO source file (Do NOT fix the bug: fixing it would make "
-                 "your test pass now and defeat reproduction).")
-    elif task == "security":
+    if task == "security":
         step5 = ("5. Make the SMALL C edit at that spot (Read the file for "
                  "the exact lines, then Edit). Do not restructure code the "
                  "flow didn't point you to.")
@@ -357,24 +283,11 @@ def build_steps(task: str, rep: str, tools) -> str:
                  "with Read to get the exact lines, then Edit). Do not "
                  "restructure code the flow didn't point you to.")
 
-    if task == "testgen":
-        step6 = ("6. Call `%s` to spot-check that a SOURCE function you "
-                 "planned is still untouched. If it reports a source flow "
-                 "change, revert that edit and re-check ONCE -- do not "
-                 "loop." % check)
-    else:
-        step6 = ("6. Call `%s` to confirm your edit made the flow change "
-                 "you planned. If it reports a mismatch, fix the edit and "
-                 "re-check ONCE -- do not loop." % check)
+    step6 = ("6. Call `%s` to confirm your edit made the flow change "
+             "you planned. If it reports a mismatch, fix the edit and "
+             "re-check ONCE -- do not loop." % check)
 
-    if task == "testgen":
-        step7 = ("7. (REQUIRED LAST) Before you stop, call `%s` (no "
-                 "arguments). It verifies the SOURCE flow of every planned "
-                 "function is UNCHANGED and that your diff touches ONLY "
-                 "test files. If it reports a source change or a non-test "
-                 "edit, fix that and call it once more. Then make sure the "
-                 "test really fails on the current code, and stop." % verify)
-    elif task == "security":
+    if task == "security":
         step7 = ("7. (REQUIRED LAST) When you believe the fix is complete "
                  "and BEFORE you stop, call `%s` (no arguments). It "
                  "re-checks EVERY planned delta against the FINAL code and "

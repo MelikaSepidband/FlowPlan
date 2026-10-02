@@ -589,92 +589,6 @@ def test_flow_check_line_drift_reports_real_verdict_on_miss(tmp_path,
     assert chk.get("observed_op") == "no_flow_change"
 
 
-# -- TEST-GEN mode (SWT, REPR_FLOW_TESTGEN=1) ---------------------------------
-#
-# Same tools, test-generation semantics: the plan records the delta a FIX
-# would make; flow_check/flow_verify prove the SOURCE flow is UNTOUCHED and
-# the diff is test-files-only.
-
-
-def test_testgen_flow_check_source_untouched(tmp_path, monkeypatch,
-                                             built_index):
-    repo = _make_git_two_fn_proj(tmp_path, monkeypatch, "tguntouched")
-    monkeypatch.setenv("REPR_FLOW_TESTGEN", "1")
-    from servers.common import flowedit_tools as fe
-    fe.flow_plan(deltas=[{"op": "add_guard", "function": "fn_a",
-                          "anchor": "m.py:1",
-                          "rationale": "a fix would guard None"}])
-    ok = fe.flow_check(function="fn_a")[0]
-    assert ok["match"] is True
-    assert ok["observed"] == "source_flow_unchanged"
-    # agent 'fixes' the bug -> source flow changes -> violation
-    m = repo / "m.py"
-    m.write_text(m.read_text().replace(
-        "def fn_a(x):\n",
-        "def fn_a(x):\n    if x is None:\n        return None\n"))
-    bad = fe.flow_check(function="fn_a")[0]
-    assert bad["match"] is False
-    assert bad["observed"] == "source_flow_changed"
-    assert "must NOT fix" in bad["note"]
-
-
-def test_testgen_flow_verify_test_only_diff(tmp_path, monkeypatch,
-                                            built_index):
-    """PASS iff source flow untouched AND the diff is test-files-only AND a
-    test edit exists; a non-test source edit is a violation."""
-    repo = _make_git_two_fn_proj(tmp_path, monkeypatch, "tgverify")
-    monkeypatch.setenv("REPR_FLOW_TESTGEN", "1")
-    from servers.common import flowedit_tools as fe
-    fe.flow_plan(deltas=[{"op": "add_guard", "function": "fn_a",
-                          "anchor": "m.py:1",
-                          "rationale": "a fix would guard None"}])
-    # no test written yet -> ISSUES (no test edit)
-    out = fe.flow_verify()[0]
-    assert out["all_planned_match"] is False
-    assert "no test-file edit" in out["note"]
-    # write the reproducing test (untracked new test file) -> PASS
-    tests_dir = repo / "tests"
-    tests_dir.mkdir()
-    (tests_dir / "test_repro.py").write_text(
-        "def test_fn_a_guards_none():\n"
-        "    from m import fn_a\n"
-        "    assert fn_a(None) is None\n", encoding="utf-8")
-    out = fe.flow_verify()[0]
-    assert out["all_planned_match"] is True, out
-    assert out["source_flow_untouched"] is True
-    assert out["test_edits"] and not out["non_test_edits"]
-    assert "PASSED" in out["note"]
-    # now the agent also 'fixes' the source -> both violations fire
-    m = repo / "m.py"
-    m.write_text(m.read_text().replace(
-        "def fn_a(x):\n",
-        "def fn_a(x):\n    if x is None:\n        return None\n"))
-    out = fe.flow_verify()[0]
-    assert out["all_planned_match"] is False
-    assert out["source_flow_untouched"] is False
-    assert out["non_test_edits"], out
-    assert "must not fix" in out["note"] or "NON-TEST" in out["note"]
-
-
-def test_testgen_server_surface_and_descriptions(tmp_path, monkeypatch,
-                                                 built_index):
-    from tests.conftest import FIXTURE_REPO
-    from servers.perrep import server as perrep_server
-    from servers.common import flowedit_tools as fe
-    monkeypatch.setenv("REPO_ROOT", str(FIXTURE_REPO))
-    monkeypatch.setenv("REPO_INDEX_DIR", str(built_index.index_dir))
-    monkeypatch.setenv("REPR_FLOW_FIRST", "1")
-    monkeypatch.setenv("REPR_FLOW_TESTGEN", "1")
-    monkeypatch.setenv("REPR_PERREP_REP", "cfg")
-    server = perrep_server.create_server()
-    assert set(server.tools) == {"flow_of", "flow_plan", "flow_check",
-                                 "flow_verify"}
-    # test-gen descriptions state the flipped contract
-    assert "FIX would make" in fe.TG_FLOW_PLAN_DESCRIPTION
-    assert "UNCHANGED" in fe.TG_FLOW_CHECK_DESCRIPTION
-    assert "ONLY test files" in fe.TG_FLOW_VERIFY_DESCRIPTION
-
-
 # -- combined cfg+dfg arm (cfgdfg): both graphs, dual op vocab ----------------
 
 
@@ -1080,27 +994,6 @@ def test_v3_cfgdfg_graded_verdicts(tmp_path, monkeypatch, built_index):
     chk = fe.flow_check(function="fn_a")[0]
     assert chk["match"] is True and chk["verdict"] == "exact", chk
     assert chk.get("graph") == "cfg"
-
-
-def test_v3_testgen_add_function_source_untouched(tmp_path, monkeypatch,
-                                                  built_index):
-    """TEST-GEN + add_function: the fix WOULD add the function; the agent
-    must not -- absent passes, adding it is a mismatch."""
-    repo = _make_git_two_fn_proj(tmp_path, monkeypatch, "v3tgadd")
-    monkeypatch.setenv("REPR_FLOW_TESTGEN", "1")
-    monkeypatch.setenv("REPR_FLOW_V3", "1")
-    from servers.common import flowedit_tools as fe
-    fe.flow_plan(deltas=[
-        {"op": "add_function", "function": "fn_new", "anchor": "m.py:8",
-         "rationale": "a fix would add this helper",
-         "fault_site": "m.py:8"}])
-    ok = fe.flow_check(function="fn_new")[0]
-    assert ok["match"] is True and ok["verdict"] == "exact", ok
-    m = repo / "m.py"
-    m.write_text(m.read_text() + "\ndef fn_new(a):\n    return a\n")
-    bad = fe.flow_check(function="fn_new")[0]
-    assert bad["match"] is False and bad["verdict"] == "mismatch", bad
-    assert "ADDED" in bad["note"]
 
 
 # -- flow3 flow_locate: the SEPARATE step-2 tool (wrong-path localization) ----
@@ -1650,60 +1543,6 @@ def _reordered_fp_repr(stored: str) -> str:
         out = out.replace("frozenset({", "frozenset({ ", 1)
     assert _eval_fp(out) == fp and out != stored
     return out
-
-
-def test_v3_testgen_source_untouched_object_compare(tmp_path, monkeypatch,
-                                                    built_index):
-    """Fix A, TESTGEN side: the SWT flow3 harness re-runs the source-
-    untouched check CROSS-PROCESS (record_final_verify -> flow_verify_cli),
-    where another hash seed reorders the stored dfg frozenset repr. Object
-    comparison must keep an UNTOUCHED source function source_flow_unchanged;
-    a corrupt snapshot must yield unknown, never a fake flow change."""
-    _make_git_two_fn_proj(tmp_path, monkeypatch, "v3tgrepr")
-    monkeypatch.setenv("REPR_FLOW_V3", "1")
-    monkeypatch.setenv("REPR_FLOW_TESTGEN", "1")
-    monkeypatch.setenv("REPR_PERREP_REP", "dfg")
-    from servers.common import flowedit_tools as fe
-    fe.flow_plan(deltas=[{"op": "add_def_use", "function": "fn_b",
-                          "anchor": "m.py:5",
-                          "rationale": "a fix would stage the value",
-                          "fault_site": "m.py:6"}])
-    plan = flowedit.load_plan()
-    plan["snapshots"]["fn_b"] = _reordered_fp_repr(plan["snapshots"]["fn_b"])
-    flowedit.save_plan(plan)
-    chk = fe.flow_check(function="fn_b")[0]
-    assert chk["match"] is True, chk
-    assert chk["observed"] == "source_flow_unchanged"
-    assert chk["verdict"] == "exact"
-    # corrupt snapshot -> honest unknown (never a fake source_flow_changed)
-    plan["snapshots"]["fn_b"] = "not a fingerprint("
-    flowedit.save_plan(plan)
-    chk = fe.flow_check(function="fn_b")[0]
-    assert chk["match"] is None, chk
-    assert chk["verdict"] == "unknown"
-    assert "corrupt" in chk["note"]
-
-
-def test_v2_testgen_source_untouched_repr_compare_unchanged(
-        tmp_path, monkeypatch, built_index):
-    """PARITY GUARD for the testgen fix-A site: with REPR_FLOW_V3 unset the
-    old repr-STRING compare stays -- a reordered stored repr still false-
-    reports source_flow_changed, byte-identical v2 behavior."""
-    _make_git_two_fn_proj(tmp_path, monkeypatch, "v2tgrepr")
-    monkeypatch.delenv("REPR_FLOW_V3", raising=False)
-    monkeypatch.setenv("REPR_FLOW_TESTGEN", "1")
-    monkeypatch.setenv("REPR_PERREP_REP", "dfg")
-    from servers.common import flowedit_tools as fe
-    fe.flow_plan(deltas=[{"op": "add_def_use", "function": "fn_b",
-                          "anchor": "m.py:5",
-                          "rationale": "a fix would stage the value"}])
-    plan = flowedit.load_plan()
-    plan["snapshots"]["fn_b"] = _reordered_fp_repr(plan["snapshots"]["fn_b"])
-    flowedit.save_plan(plan)
-    chk = fe.flow_check(function="fn_b")[0]
-    assert chk["match"] is False, chk
-    assert chk["observed"] == "source_flow_changed"
-    assert "verdict" not in chk
 
 
 def test_v3_beniget_unbound_identifiers_zero_stdout(tmp_path, monkeypatch,

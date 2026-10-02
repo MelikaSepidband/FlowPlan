@@ -1,160 +1,219 @@
-# Flow Graph Tools
+# FlowPlan
 
-Flow-first code representations — control-flow graphs (CFG) and data-flow graphs
-(DFG) — served to a coding agent as MCP tools, evaluated on three editing
-benchmarks against a tool-less baseline.
+**Reducing the token cost of coding agents with abstraction-guided planning and verification.**
 
-Each benchmark × condition cell runs the **Claude Code** agent (default model
-`claude-haiku-4-5`, low reasoning effort) on a leak-free checkout of the buggy
-repository. In the flow conditions the agent has **no code map and no repo-wide
-search tool from us** — its window into the code is the function-level flow
-graph, plus its own built-in tools.
+LLM-based coding agents resolve repository issues through a long interaction
+loop, and the growing trajectory is replayed at every model call. FlowPlan
+lets the agent make its key repair decisions on a program abstraction instead
+of on raw source text. For the function under investigation it builds a
+**per-function control-flow graph (CFG) or data-flow graph (DFG)**. The agent
+
+1. **locates** the candidate fault on a graph element,
+2. **plans** the repair as explicit *graph deltas* before touching the code,
+3. **edits** the source and **checks** that the rebuilt graph changed as planned,
+4. **verifies** the whole plan against the finished patch before it stops.
+
+The plan makes the repair intent explicit before editing, and the check gives
+a machine-checkable completion criterion, which replaces much of the
+re-reading and re-testing an agent otherwise does after an edit.
+
+This repository is the replication package of the paper. It contains
+
+- the FlowPlan MCP server (five tools) and the `/flowfix` skill,
+- the evaluation harness for three benchmarks (SWE-bench Pro, SWE-bench
+  Verified, SecBench),
+- the benchmark samples (instance ids) we evaluated on,
+- our reproductions of five token-reduction methods on the same agent
+  ([related_works/README.md](related_works/README.md)).
+
+## How FlowPlan works
+
+FlowPlan is attached to an otherwise vanilla **Claude Code** session through
+the Model Context Protocol (MCP). The agent keeps its standard file-reading,
+search, editing, and shell tools.
+
+| tool | phase | what it does |
+|---|---|---|
+| `flow_of` | locate | resolves a function name through the symbol index and returns its CFG or DFG |
+| `flow_locate` | locate | anchors the candidate fault on a graph element (block, edge, def-use relation, or line) and validates the reference |
+| `flow_plan` | plan | records the intended repair as typed graph deltas (e.g. `add_guard`, `change_condition`, `rewire_edge`, `no_flow_change`, `add_function`) and snapshots the fingerprint of each target function at `HEAD` |
+| `flow_check` | edit and check | rebuilds the graph of an edited function and compares the observed delta with the planned one (`exact` / `same_family` / `mismatch`) |
+| `flow_verify` | verify | runs the same comparison over the complete plan and audits the working tree for modified functions the plan does not cover |
+
+The four-phase policy (locate, plan, edit-and-check, verify) is delivered as a
+Claude Code **skill**: the user prompt starts with `/flowfix`, and the skill
+body is generated at run time into the per-run
+`claude-home/skills/flowfix/SKILL.md` from a single source
+(`experiments/common/flow_protocol.py`). The policy is advisory: no hook forces
+a tool call, disables a native tool, or prevents the agent from stopping.
+
+Python graphs are derived from the abstract syntax tree
+(`servers/cfg_server`, `servers/dfg_server`). C and C++ graphs are extracted
+from a [Joern](https://joern.io) code-property graph restricted to the
+functions on the crash stack (`servers/common/joern*.py`). Function names are
+resolved through a tree-sitter symbol index built once per repository commit,
+outside the agent session (`indexer/`).
 
 ## Conditions
 
-| condition | tool surface |
-|---|---|
-| `baseline` | no MCP tools (agent's built-in Read/Grep/Edit only) |
-| `cfg_perrep_flow3` | 5 flow tools over the **control-flow** graph |
-| `dfg_perrep_flow3` | 5 flow tools over the **def-use (data-flow)** graph |
-| `cfgdfg_perrep_flow3` | 5 flow tools over **both** graphs |
+Every benchmark instance is run once per condition in a fresh headless Claude
+Code session.
 
-The five MCP tools: `flow_of` (get a function's graph), `flow_locate` (declare
-the faulty spot on the graph), `flow_plan` (record the planned graph delta),
-`flow_check` (verify an edit produced the planned delta), `flow_verify` (final
-whole-plan re-verification against the finished code).
+| condition | name in the paper | agent |
+|---|---|---|
+| `baseline` | vanilla agent | Claude Code with its default tools, no MCP server |
+| `cfg_perrep_flow3` | FlowPlan (CFG) | default tools + the five flow tools over control-flow graphs + `/flowfix` |
+| `dfg_perrep_flow3` | FlowPlan (DFG) | default tools + the five flow tools over data-flow graphs + `/flowfix` |
 
-The protocol is delivered as a **skill**: the user prompt starts with
-`/flowfix`, and the skill body (generated at runtime into the per-run
-`claude-home/skills/flowfix/SKILL.md`) instructs: localize in the graph →
-declare the fault site → plan the graph delta → make the smallest code edit →
-re-verify the graph. Per-task variants exist for repair (SWE-bench Pro),
-test generation (SWT-bench protocol), and C security patching (SecBench).
+`cfgdfg_perrep_flow3` serves both graphs at once; it is available in the code
+but is not part of the paper's evaluation. The five compared methods are
+further conditions of the same runners (`baseline_noexec`, `baseline_eet` /
+`baseline_eetB`, `baseline_sherloc`, `baseline_agentdiet`,
+`baseline_seerepo`); see [related_works/README.md](related_works/README.md).
 
 ## Benchmarks
 
-| benchmark | task | language | instances |
-|---|---|---|---|
-| SWE-bench Pro | bug repair | Python | `samples/swebench_pro_n253` (253) |
-| SWT-bench protocol | test generation | Python | 50 instances — `data/ids/swt_50.json` |
-| SecBench | security patch (sanitizer crash) | C/C++ | `samples/secbench_patch_n169` (169) |
+| benchmark | task | language | sample | instance ids |
+|---|---|---|---|---|
+| [SWE-bench Pro](https://github.com/scaleapi/SWE-bench_Pro-os) | issue repair | Python | 158 of the 266 public Python instances | `data/ids/swebench_pro_158.json` |
+| [SWE-bench Verified](https://huggingface.co/datasets/princeton-nlp/SWE-bench_Verified) | issue repair | Python | 218 of 500 | `data/ids/swebench_verified_218.json` |
+| SecBench | security patching (sanitizer crash + proof-of-concept input) | C/C++ | 169 of the 300 evaluation instances | `data/ids/secbench_169.json` |
 
-**About the test-generation benchmark:** we follow the
-[SWT-bench](https://arxiv.org/abs/2406.12952) task formulation and grading
-protocol: the agent writes a TEST that reproduces the reported bug, and
-grading is the two-run protocol — the candidate test suite runs on the buggy
-tree and on the gold-fixed tree; success requires an agent-introduced
-fail→pass test and no pass→fail regression.
+Each sample is sized for a 95% confidence level and a 5% margin of error;
+random draws use seed 42. The instance records are in
+`samples/swebench_pro_n266/` (all 266 public Python instances; the 108
+outside the evaluation sample are the pool the EET experience base is built
+from, see `data/eet/_eet_split.json`) and `samples/secbench_patch_n169/`.
+SWE-bench Verified instances are read from the Hugging Face dataset.
 
-The subsets we ran are in `data/ids/`. SWE-bench Pro: all 253, run as
-`swe_70.json` (first tranche, built 30 + 20 + 20) then `swe_183_rest.json`
-(the remainder). Test generation: 50 instances (`swt_50.json`, built as
-30 + 20). SecBench: `sec_166.json` (166 of the 169; `sec_50.json` was the
-first tranche).
+All conditions receive the same task description: `problem_statement`,
+`requirements`, and `interface` on SWE-bench Pro; `problem_statement` on
+SWE-bench Verified; the bug report and the sanitizer report on SecBench. No
+condition receives the reference patch or the names of the fail-to-pass
+tests. Patches are graded with each benchmark's official evaluation harness.
+
+The paper's runs use Claude Code 2.1.220 with `claude-haiku-4-5` and
+`claude-sonnet-5`, both at low reasoning effort.
 
 ## Requirements
 
 - **Linux or WSL2** (the harness uses `fcntl`, process groups, POSIX paths).
-- **Python 3.12** with a venv at the repo root (`.venv/` — the runners spawn
+- **Python 3.12** with a venv at the repo root (`.venv/`; the runners spawn
   `.venv/bin/python` for the MCP server subprocess).
-- **git** and network access to github.com (repository checkouts are cloned and
-  cached).
-- **Claude Code CLI** — the **native Linux** install (default
-  `~/.local/bin/claude`, override with `CLAUDE_BIN`), logged in (`claude` once,
-  complete OAuth). On WSL, do **not** use a Windows npm-installed `claude`; it
-  breaks skill and MCP delivery.
-- **Docker** (grading only).
-- **SecBench only:** [Joern](https://joern.io) CLI and a JDK 21 — set
-  `JOERN_CLI_DIR` and `JOERN_JAVA_HOME` if not at the defaults
-  (`~/tools/joern-cli`, `~/tools/jdk-21.0.5+11`).
-- **SWE-bench Pro / SWT-bench grading only:** the official SWE-bench Pro
-  harness checkout (its `run_scripts/<instance>/` and `dockerfiles/`), pointed
-  to by `SWEBENCH_PRO_HARNESS`. Grading docker images
-  (`jefzda/sweap-images:<tag>`, `hwiwonlee/secb.eval.x86_64.<id>`) are pulled
-  on demand.
+- **git** and network access to github.com (repositories are cloned and
+  cached under `~/swebench_cache` and `~/secbench_cache`).
+- **Claude Code CLI**, the native Linux install (default
+  `~/.local/bin/claude`; pass `--claude-bin <path>` to pin a build), logged
+  in. On WSL, do not use a Windows npm-installed `claude`; it breaks skill
+  and MCP delivery.
+- **Docker** for grading. The grading images
+  (`jefzda/sweap-images:<tag>`, the SWE-bench images, and
+  `hwiwonlee/secb.eval.x86_64.<id>`) are pulled or built on demand.
+- **SWE-bench Pro grading:** a checkout of the official harness
+  (<https://github.com/scaleapi/SWE-bench_Pro-os>; its `run_scripts/` and
+  `dockerfiles/`), pointed to by `SWEBENCH_PRO_HARNESS`.
+- **SWE-bench Verified:** the dataset
+  (`huggingface-cli download princeton-nlp/SWE-bench_Verified --repo-type dataset`)
+  and, for grading, the official `swebench` package installed for the system
+  `python3` (we used 4.1.0).
+- **SecBench:** the [Joern](https://joern.io) CLI (we used 4.0.557) at
+  `~/tools/joern-cli` and a JDK 21 at `~/tools/jdk-21.0.5+11`.
 
 ## Setup
 
 ```bash
 python3.12 -m venv .venv
-.venv/bin/pip install -e .        # installs the pinned dependencies
+.venv/bin/pip install -e .        # installs the pinned dependencies only
 claude                            # once, to log in (native Linux CLI)
 ```
 
-Environment variables (all optional unless noted):
-
 | variable | default | meaning |
 |---|---|---|
-| `CLAUDE_BIN` | `~/.local/bin/claude` | Claude Code CLI binary |
-| `SWEBENCH_CACHE` | `~/swebench_cache` | clone/worktree/index cache (SWE/SWT) |
-| `SWEBENCH_PRO_HARNESS` | — | official harness dir (**required for `--grade`** on SWE/SWT) |
-| `SECBENCH_SAMPLES_DIR` | `samples/secbench_patch_n169` | SecBench instance dir |
-| `JOERN_CLI_DIR` | `~/tools/joern-cli` | Joern install (SecBench) |
-| `JOERN_JAVA_HOME` | `~/tools/jdk-21.0.5+11` | JDK for Joern (SecBench) |
-| `REPR_TEST_SHIM` | off | `1` = per-cell python/pytest shim venv (**use for SWE/SWT**) |
+| `SWEBENCH_CACHE` | `~/swebench_cache` | clone / worktree / index cache (SWE-bench Pro and Verified) |
+| `SWEBENCH_PRO_HARNESS` | `~/code_rep_data/swebench_pro/official_harness` | official SWE-bench Pro harness checkout (needed for `--grade`) |
+| `SWEBENCH_VERIFIED_PARQUET` | Hugging Face hub cache | test-split parquet of SWE-bench Verified |
+| `SECBENCH_SAMPLES_DIR` | `samples/secbench_patch_n169` | SecBench instance records |
+| `REPR_TEST_SHIM` | off | `1` gives each cell its own python/pytest environment for the agent's test runs (used for the SWE-bench runs) |
 
 ## Running
 
-Each runner executes `instances × conditions` cells, writes one directory per
-cell under `results/<exp-name>/<instance>__<condition>/`, and **skips cells
-that already have a `grade.json`** — re-running the same command resumes an
-interrupted batch.
+Each runner executes `instances x conditions` cells and writes one directory
+per cell under `results/<exp-name>/<instance>__<condition>/`. Cells that
+already have a `grade.json` are skipped, so re-running the same command
+resumes an interrupted batch. Use `--model claude-sonnet-5` for the Sonnet
+runs. To smoke-test, point `--ids-file` at a JSON list with a single id.
 
-SWE-bench Pro (repair):
+**SWE-bench Pro**
 
 ```bash
 REPR_TEST_SHIM=1 .venv/bin/python -m experiments.swebench_pro.run_experiment \
-  --ids-file data/ids/swe_70.json \
-  --conditions baseline cfg_perrep_flow3 dfg_perrep_flow3 cfgdfg_perrep_flow3 \
-  --exp-name swe70 --effort-flag low --concurrency 2 --grade
+  --ids-file data/ids/swebench_pro_158.json \
+  --conditions baseline cfg_perrep_flow3 dfg_perrep_flow3 \
+  --exp-name pro158_haiku --model claude-haiku-4-5 --effort-flag low \
+  --concurrency 2 --grade
 ```
 
-Test generation (SWT-bench protocol; graded by the two-run protocol —
-the metric is *reproduction*, not resolution):
+**SWE-bench Verified** (same runner with `--dataset verified`; graded
+afterwards with the official SWE-bench harness)
 
 ```bash
-REPR_TEST_SHIM=1 .venv/bin/python -m experiments.swtbench.run_experiment \
-  --ids-file data/ids/swt_50.json \
-  --conditions baseline cfg_perrep_flow3 dfg_perrep_flow3 cfgdfg_perrep_flow3 \
-  --exp-name swt50 --effort-flag low --concurrency 2 --grade
+REPR_TEST_SHIM=1 .venv/bin/python -m experiments.swebench_pro.run_experiment \
+  --dataset verified --ids-file data/ids/swebench_verified_218.json \
+  --conditions baseline cfg_perrep_flow3 dfg_perrep_flow3 \
+  --exp-name verified218_haiku --model claude-haiku-4-5 --effort-flag low \
+  --concurrency 2
+
+.venv/bin/python -m experiments.swebench_verified.grade_official \
+  --results-dir results/verified218_haiku \
+  --conditions baseline cfg_perrep_flow3 dfg_perrep_flow3 \
+  --run-id verified218_haiku --cache-level base --max-workers 4
 ```
 
-SecBench (C security patching; keep `--concurrency 1` — each cell boots its
-own Joern server):
+The grader writes the resolved instance ids per condition to
+`results/<exp-name>/official_grade_summary.json`. Because these cells are
+graded afterwards, they carry no `grade.json`; to resume an interrupted
+Verified batch, pass an `--ids-file` with the ids whose cell has no
+`result.json` yet.
+
+**SecBench** (keep `--concurrency 1`: each cell boots its own Joern server)
 
 ```bash
 .venv/bin/python -m experiments.secbench.run_experiment \
-  --ids-file data/ids/sec_50.json \
-  --conditions baseline cfg_perrep_flow3 dfg_perrep_flow3 cfgdfg_perrep_flow3 \
-  --exp-name sec50 --effort-flag low --concurrency 1 --grade
+  --ids-file data/ids/secbench_169.json \
+  --conditions baseline cfg_perrep_flow3 dfg_perrep_flow3 \
+  --exp-name sec169_haiku --model claude-haiku-4-5 --effort-flag low \
+  --concurrency 1 --grade
 ```
 
-Tip: smoke-test one instance first by pointing `--ids-file` at a JSON list
-with a single id.
+### Session limits
 
-### Cell artifacts
+Each session is capped at 80 model turns, $2, and 25 minutes on SWE-bench Pro
+and Verified, and at 40 turns, $1.50, and 25 minutes on SecBench. These are
+the runners' defaults (`--max-turns`, `--max-budget-usd`, `--timeout-sec`)
+and are the same for every condition. A run that reaches a limit is graded
+on the patch it produced up to that point.
 
-Each cell directory contains `prompt.md` (exact user prompt), `mcp.json`,
-`transcript.jsonl`, `mcp_calls.jsonl`, `flow_plan.json` / `flow_locate.json` /
-`flow_verify_final.json` (flow arms), `model_patch.diff`, `result.json`
-(token usage/cost), and `grade.json`.
+### Cell artifacts and token accounting
 
-Token accounting used in our tables: `input + output + cache_read`
-(cache-creation tokens excluded).
+Each cell directory contains `prompt.md` (the exact user prompt), `mcp.json`,
+`transcript.jsonl`, `meta.json`, `result.json` (the CLI's final usage
+record), the patch (`patch.diff`, or `model_patch.diff` on SecBench), and
+`grade.json`. FlowPlan cells also contain `mcp_calls.jsonl`,
+`flow_locate.json`, `flow_plan.json`, and `flow_verify_final.json`.
 
-### OAuth note
+Token consumption is the sum of four provider-reported components over all
+model calls of a cell: `input_tokens`, `output_tokens`,
+`cache_read_input_tokens`, and `cache_creation_input_tokens` (cache write).
+Auxiliary model calls that a compared method requires, such as a separate
+localization stage or reflection calls, are merged into the cell's
+`result.json`.
 
-Long batches outlive the CLI's OAuth token. The runners check remaining token
-lifetime before each cell and **skip without writing artifacts** when it is
-about to expire — re-login (`claude`) and re-run the same command to resume.
+### Login expiry
 
-## Related-work arms
-
-Six published token-reduction methods were run on plain Claude Code on the
-same 30-instance subset, each as one condition of the same runner:
-`baseline_noexec`, `baseline_prunerB`, `baseline_csniper`, `baseline_cbmem2`,
-`baseline_agentsmd`, `baseline_cmv2`. What each one is, the third-party
-pins, and the launch lines are in [related_works/README.md](related_works/README.md).
+Long batches can outlive the CLI's OAuth token. The runners check the
+remaining token lifetime before each cell and skip the cell without writing
+artifacts when the token is about to expire; log in again (`claude`) and
+re-run the same command to resume.
 
 ## Tests
 
@@ -162,31 +221,38 @@ pins, and the launch lines are in [related_works/README.md](related_works/README
 .venv/bin/python -m pytest tests/ -q
 ```
 
-Hermetic: MCP tool semantics, protocol/skill text, condition parsing,
-grading logic, and the C/Joern query surface (via fake clients; live Joern
-tests skip when Joern is absent).
+The tests are hermetic: MCP tool semantics, the policy and skill text,
+condition parsing, and the C/Joern query surface through fake clients (live
+Joern tests are skipped when Joern is absent).
 
 ## Repository layout
 
 ```
 experiments/
-  common/flow_protocol.py   # the /flowfix protocol + skill builder (single source)
-  common/joern_server.py    # per-cell joern --server manager (SecBench)
-  flowverify.py             # final plan-vs-code verdict recorder
-  swebench_pro/             # repair runner + leak-free checkout + docker grading
-  swtbench/                 # test-gen runner + two-run grader
-  secbench/                 # C security runner + CPG build + sanitizer grading
+  common/flow_protocol.py     the /flowfix policy + skill builder (single source)
+  common/joern_server.py      per-cell joern --server manager (SecBench)
+  common/testenv_ladder.py    interpreter-compatible test environment for a cell
+  flowverify.py               final plan-vs-code verdict recorder
+  swebench_pro/               SWE-bench runner (Pro and Verified), leak-free checkout, Pro grading
+  swebench_verified/          Verified instance loader + official-harness grading
+  secbench/                   SecBench runner, CPG build, sanitizer grading
 servers/
-  perrep/                   # the MCP server entrypoint (python -m servers.perrep)
-  common/flowedit*.py       # the 5 flow tools + fingerprint/delta engine
-  cfg_server/               # Python CFG engine (stdlib ast + networkx)
-  dfg_server/               # Python def-use engine (beniget + gast)
-  common/joern*.py          # C/C++ path (Joern client, snippet-CPG fingerprints)
-indexer/                    # symbols.db builder (function-name resolution)
-perrep/                     # engine support imported by the server
-samples/                    # benchmark instance data
-data/ids/                   # canonical instance subsets
-tools/, servers/pruner_server/   assets for the related-work arms (see related_works/README.md)
-related_works/              # the six published comparators run on Claude Code: docs + as-run scripts
+  perrep/                     the MCP server entry point (python -m servers.perrep)
+  common/flowedit*.py         the five flow tools + fingerprint / delta engine
+  cfg_server/                 Python CFG engine (stdlib ast + networkx)
+  dfg_server/                 Python def-use engine (beniget + gast)
+  common/joern*.py            C/C++ path (Joern client, snippet-CPG fingerprints)
+  sherloc_server/, seerepo_server/, pruner_server/   servers of the compared methods
+indexer/                      symbol index builder (function-name resolution)
+perrep/                       engine support imported by the server
+samples/                      benchmark instance records (SWE-bench Pro, SecBench)
+data/ids/                     evaluation samples (instance ids)
+data/eet/                     EET experience bases built from held-out instances
+tools/                        assets of the compared methods
+related_works/                the compared methods: what each one is, pins, launch lines
 tests/
 ```
+
+`data/ids/` also keeps the subsets used in earlier pilot runs
+(`swe_*.json`, `sec_*.json`, `swe30_related_works.json`); the paper's
+evaluation uses the three files listed under [Benchmarks](#benchmarks).

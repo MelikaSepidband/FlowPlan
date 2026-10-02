@@ -45,21 +45,30 @@ MINI_SRC = EET_SRC / "mini-swe-agent" / "src"
 # Lite/Verified -- tests whether their method transfers OFF-distribution (none of
 # our three repos appear in it).
 STORE_THEIRS = MINI_SRC / "minisweagent" / "experience" / "extracted_experiences_summarized.jsonl"
-# Arm B (baseline_eetB): a base built from OUR held-out swe183 baseline
-# trajectories with THEIR pipeline (_eet_build_base.py) -- their INTENDED
-# setting, where the base covers the target repositories.
+# Arm B (baseline_eetB): a base built from OUR held-out baseline trajectories
+# with THEIR pipeline (_eet_build_base.py) -- their INTENDED setting, where the
+# base covers the target repositories. SWE-bench Pro: the 108 pool instances
+# outside the 158-instance evaluation sample (data/eet/_eet_split.json).
 _OURS_SHIPPED = STUDY_ROOT / "data" / "eet" / "extracted_experiences_summarized_ours.jsonl"
 _OURS_STUDY = STUDY_ROOT / "results" / "_eet_base_ours" / "extracted_experiences_summarized_ours.jsonl"
 STORE_OURS = _OURS_SHIPPED if _OURS_SHIPPED.is_file() else _OURS_STUDY
+# Arm B on SecBench: the same pipeline over baseline trajectories of the
+# evaluation-split instances OUTSIDE the 169-instance sample, so the base and
+# the evaluation sample share no instance.
+_SEC_SHIPPED = STUDY_ROOT / "data" / "eet" / "extracted_experiences_summarized_ours_sec169.jsonl"
+_SEC_STUDY = STUDY_ROOT / "results" / "_eet_base_ours_sec169" / "extracted_experiences_summarized_ours.jsonl"
+STORE_OURS_SEC169 = _SEC_SHIPPED if _SEC_SHIPPED.is_file() else _SEC_STUDY
 STORE_JSONL = STORE_THEIRS      # default; overridden per condition by set_store()
 
 
 def set_store(which: str) -> Path:
-    """'theirs' (arm A) or 'ours' (arm B). Everything else about the method --
-    thresholds, template, coupling -- is identical between the arms; only the
-    experience base changes, which is exactly the comparison."""
+    """'theirs' (arm A), 'ours' (arm B, SWE-bench Pro base) or 'ours_sec169'
+    (arm B, SecBench base). Everything else about the method -- thresholds,
+    template, coupling -- is identical between the arms; only the experience
+    base changes, which is exactly the comparison."""
     global STORE_JSONL
-    STORE_JSONL = STORE_OURS if which == "ours" else STORE_THEIRS
+    STORE_JSONL = {"ours": STORE_OURS,
+                   "ours_sec169": STORE_OURS_SEC169}.get(which, STORE_THEIRS)
     return STORE_JSONL
 
 # their ExperienceRetrievalAgentConfig defaults (experience_retrieval.py:18-45)
@@ -91,8 +100,17 @@ def _their_modules():
     Their package prints a banner and loads a global config at import; keep
     stdout clean for callers that care.
     """
-    if str(MINI_SRC) not in sys.path:
-        sys.path.insert(0, str(MINI_SRC))
+    # EET and SeeRepo are both forks of mini-swe-agent under the same package
+    # name; drop the other fork if it is already imported in this process and
+    # put THIS fork's src first on sys.path so the fresh import resolves to it.
+    _loaded = sys.modules.get("minisweagent")
+    if _loaded is not None and not str(getattr(_loaded, "__file__", "") or
+                                      getattr(_loaded, "__path__", [""])[0]).startswith(str(MINI_SRC)):
+        for k in [k for k in sys.modules if k == "minisweagent" or k.startswith("minisweagent.")]:
+            del sys.modules[k]
+    if str(MINI_SRC) in sys.path:
+        sys.path.remove(str(MINI_SRC))
+    sys.path.insert(0, str(MINI_SRC))
     import contextlib
     import io
     buf = io.StringIO()
